@@ -5,11 +5,11 @@ import numpy as np
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from SoccerNet.Evaluation.MV_FoulRecognition import evaluate
 import torch
-from dataset import MultiViewDataset
-from train import trainer, evaluation
+from datasets.dataset import MultiViewDataset
+from utils.train import trainer, evaluation
 import torch.nn as nn
 import torchvision.transforms as transforms
-from model import MVNetwork
+from models import MVNetwork
 from config.classes import EVENT_DICTIONARY, INVERSE_EVENT_DICTIONARY
 from torchvision.models.video import R3D_18_Weights, MC3_18_Weights
 from torchvision.models.video import R2Plus1D_18_Weights, S3D_Weights
