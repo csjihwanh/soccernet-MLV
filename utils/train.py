@@ -135,7 +135,7 @@ def train(dataloader,
 
     if True:
         for targets_offence_severity, targets_action, mvclips, action in dataloader:
-            print(type(mvclips))
+            print(mvclips.shape)
             targets_offence_severity = targets_offence_severity.cuda()
             targets_action = targets_action.cuda()
             mvclips = mvclips.cuda().float()

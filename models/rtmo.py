@@ -9,17 +9,21 @@ from mmpose.utils import register_all_modules
 from mmpose.registry import VISUALIZERS
 from mmpose.structures import merge_data_samples
 
+import torch
+import numpy  as np
+
 register_all_modules()
 
 test_img = '../test/test.jpeg'
 out_path = 'output.jpg'
  # or device='cuda:0'
 
-class RTMO:
+class RTMOBackbone(torch.nn.Module):
     def __init__(self, device='cuda:0'):
+        super().__init__()
         self.init_setting = {
-            'pose2d': '../config/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py',
-            'pose2d_weights': '../checkpoints/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth',
+            'pose2d': 'config/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py',
+            'pose2d_weights': 'checkpoints/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth',
             'pose3d': None,
             'pose3d_weights': None,
             'det_model': None,
@@ -50,12 +54,19 @@ class RTMO:
             'pred_out_dir': '',
             'show_alias': False
         }
-        self.model = init_model(self.init_setting['pose2d'], self.init_setting['pose2d_weights'], device=self.init_setting['device'])
-        self.inferencer = MMPoseInferencer(**self.init_setting)
-
-    def inference(self, input):
-        for _ in self.inferencer(**self.call_setting):
-            pass
+        rtmo = init_model(self.init_setting['pose2d'], self.init_setting['pose2d_weights'], device=self.init_setting['device'])
+        self.model = torch.nn.Sequential(
+            rtmo.backbone,
+            rtmo.neck
+        ).cuda()
+        
+    def forward(self, x):
+        return self.model(x)
         
 
 
+if __name__ == '__main__':
+    rtmo = RTMOBackbone()
+    result = rtmo.model(torch.randn(1,3,416,416).to('cuda:0'))
+    print(np.shape(result[0].cpu()), np.shape(result[1].cpu()))
+    # torch.Size([1, 512, 26, 26]) torch.Size([1, 512, 13, 13])

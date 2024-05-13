@@ -1,12 +1,24 @@
 from utils.utils import batch_tensor, unbatch_tensor
 import torch
 from torch import nn
+from .rtmo import RTMOBackbone
+
+class RTMOHead(nn.Module):
+    def __init__(self, feat_dim):
+        super().__init__()
+        # torch.Size([1, 512, 26, 26]) torch.Size([1, 512, 13, 13])
+
+
+
+    def forward(self, x):   
+        pass
 
 
 class WeightedAggregate(nn.Module):
-    def __init__(self,  model, feat_dim, lifting_net=nn.Sequential()):
+    def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential()):
         super().__init__()
         self.model = model
+        self.pose_model = pose_model
         self.lifting_net = lifting_net
         num_heads = 8
         self.feature_dim = feat_dim
@@ -21,13 +33,17 @@ class WeightedAggregate(nn.Module):
         )        
 
         self.relu = nn.ReLU()
+
+
    
 
 
     def forward(self, mvimages):
-        B, V, C, D, H, W = mvimages.shape # Batch, Views, Channel, Depth, Height, Width
+        B, V, C, D, H, W = mvimages.shape # Batch, Views, Channel, Depth, Height, Width # 2 2 3 16 224 224 # depth == frame num
         aux = self.lifting_net(unbatch_tensor(self.model(batch_tensor(mvimages, dim=1, squeeze=True)), B, dim=1, unsqueeze=True))
-
+        print(aux.shape) # 2 2 400
+        print('batch: ', batch_tensor(mvimages, dim=1, squeeze=True).shape) # 4 3 16 224 224
+        print('rtmo_Backbone: ', self.pose_model(batch_tensor(mvimages, dim=1, squeeze=True)).shape)
 
         ##################### VIEW ATTENTION #####################
 
@@ -89,6 +105,9 @@ class ViewAvgAggregate(nn.Module):
 class MVAggregate(nn.Module):
     def __init__(self,  model, agr_type="max", feat_dim=400, lifting_net=nn.Sequential()):
         super().__init__()
+
+        pose_model = RTMOBackbone()
+
         self.agr_type = agr_type
 
         self.inter = nn.Sequential(
@@ -115,10 +134,10 @@ class MVAggregate(nn.Module):
         elif self.agr_type == "mean":
             self.aggregation_model = ViewAvgAggregate(model=model, lifting_net=lifting_net)
         else:
-            self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net)
+            self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
 
     def forward(self, mvimages):
-
+        
         pooled_view, attention = self.aggregation_model(mvimages)
 
         inter = self.inter(pooled_view)

@@ -200,7 +200,7 @@ def main(*args):
     if path_to_model_weights != "":
         path_model = os.path.join(path_to_model_weights)
         load = torch.load(path_model)
-        model.load_state_dict(load['state_dict'])
+        model.load_state_dict(load['state_dict'], strict=False)
 
     if only_evaluation == 3:
 

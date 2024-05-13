@@ -32,7 +32,7 @@ class MVNetwork(torch.nn.Module):
         elif net_name == "r2plus1d_18":
             weights_model = R2Plus1D_18_Weights.DEFAULT
             network = r2plus1d_18(weights=weights_model)
-        elif net_name == "mvit_v2_s":
+        elif net_name == "8":
             weights_model = MViT_V2_S_Weights.DEFAULT
             network = mvit_v2_s(weights=weights_model)
             self.feat_dim = 400

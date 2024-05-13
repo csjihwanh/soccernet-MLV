@@ -1,4 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+
+import cv2
+import numpy as np
+
 from argparse import ArgumentParser
 from typing import Dict
 
@@ -10,6 +14,34 @@ POSE2D_SPECIFIC_ARGS = dict(
     rtmo=dict(bbox_thr=0.1, nms_thr=0.65, pose_based_nms=True),
 )
 
+def load_video_to_ndarray(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error opening video file")
+        return None
+
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame_rgb)
+
+    frames_array = np.array(frames)
+
+    cap.release()
+
+    return frames_array
+
+def load_video_stream(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error opening video file")
+        return None
+
+    return cap
 
 def parse_args():
     parser = ArgumentParser()
@@ -214,8 +246,10 @@ def main():
         display_model_aliases(model_alises)
     else:
         inferencer = MMPoseInferencer(**init_args)
+        #call_args['inputs'] = load_video_stream(call_args['inputs'])
         for _ in inferencer(**call_args):
             pass
+        #call_args['inputs'].release()
 
 
 if __name__ == '__main__':
