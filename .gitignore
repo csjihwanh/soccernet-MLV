@@ -1,2 +1,7 @@
 /checkpoints
 /test
+SNPOSE/
+logs/
+predicitions_chall.json
+predicitions_test.json
+test.py

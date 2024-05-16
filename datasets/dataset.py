@@ -5,7 +5,6 @@ import random
 from .data_loader import label2vectormerge, clips2vectormerge
 from torchvision.io.video import read_video
 
-
 class MultiViewDataset(Dataset):
     def __init__(self, path, start, end, fps, split, num_views, transform=None, transform_model=None):
 
@@ -104,7 +103,8 @@ class MultiViewDataset(Dataset):
                 final_frames = self.transform(final_frames)
 
             final_frames = self.transform_model(final_frames)
-            final_frames = final_frames.permute(1, 0, 2, 3)
+            #final_frames = final_frames.permute(0, 1, 2, 3)
+            #final_frames = final_frames.permute(1, 0, 2, 3)
             
             if num_view == 0:
                 videos = final_frames.unsqueeze(0)

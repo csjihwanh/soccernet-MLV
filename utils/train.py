@@ -19,7 +19,7 @@ def trainer(train_loader,
             epoch_start,
             model_name,
             path_dataset,
-            max_epochs=1000
+            max_epochs=1000,
             ):
     
 
@@ -27,7 +27,7 @@ def trainer(train_loader,
     counter = 0
 
     for epoch in range(epoch_start, max_epochs):
-        
+
         print(f"Epoch {epoch+1}/{max_epochs}")
     
         # Create a progress bar
@@ -88,15 +88,16 @@ def trainer(train_loader,
 
         counter += 1
 
-        if counter > 3:
-            state = {
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict()
-            }
-            path_aux = os.path.join(best_model_path, str(epoch+1) + "_model.pth.tar")
-            torch.save(state, path_aux)
+        #if counter > 3:
+        state = {
+        'epoch': epoch + 1,
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict()
+        }
+        path_aux = os.path.join(best_model_path, str(epoch+1) + "_model.pth.tar")
+        torch.save(state, path_aux)
+        print(f"model saved at {path_aux}")
         
     pbar.close()    
     return
@@ -110,6 +111,7 @@ def train(dataloader,
           train=False,
           set_name="train",
           pbar=None,
+          GPU=0,
         ):
     
 
@@ -135,11 +137,10 @@ def train(dataloader,
 
     if True:
         for targets_offence_severity, targets_action, mvclips, action in dataloader:
-            print(mvclips.shape)
             targets_offence_severity = targets_offence_severity.cuda()
             targets_action = targets_action.cuda()
             mvclips = mvclips.cuda().float()
-            
+
             if pbar is not None:
                 pbar.update()
 
@@ -210,6 +211,7 @@ def train(dataloader,
           
         gc.collect()
         torch.cuda.empty_cache()
+        #torch.save(model.state_dict(), f'/hub_data1/intern/soccernet-pose/checkpoints/model{epoch}.pth')
     
     data["Actions"] = actions
     with open(os.path.join(model_name, prediction_file), "w") as outfile: 

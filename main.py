@@ -3,7 +3,12 @@ import logging
 import time
 import numpy as np
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+
 from SoccerNet.Evaluation.MV_FoulRecognition import evaluate
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = str('3')
+
 import torch
 from datasets.dataset import MultiViewDataset
 from utils.train import trainer, evaluation
@@ -11,6 +16,8 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 from models import MVNetwork
 from config.classes import EVENT_DICTIONARY, INVERSE_EVENT_DICTIONARY
+from torchvision.transforms import InterpolationMode
+
 from torchvision.models.video import R3D_18_Weights, MC3_18_Weights
 from torchvision.models.video import R2Plus1D_18_Weights, S3D_Weights
 from torchvision.models.video import MViT_V2_S_Weights, MViT_V1_B_Weights
@@ -88,6 +95,7 @@ def main(*args):
         continue_training = args.continue_training
         only_evaluation = args.only_evaluation
         path_to_model_weights = args.path_to_model_weights
+        model_to_store = args.model_to_store
     else:
         print("EXIT")
         exit()
@@ -100,8 +108,8 @@ def main(*args):
     os.makedirs(os.path.join("models", os.path.join(model_name, os.path.join(str(num_views), os.path.join(pre_model, os.path.join(str(LR),
                             "_B" + str(batch_size) + "_F" + str(number_of_frames) + "_S" + "_G" + str(gamma) + "_Step" + str(step_size)))))), exist_ok=True)
 
-    best_model_path = os.path.join("models", os.path.join(model_name, os.path.join(str(num_views), os.path.join(pre_model, os.path.join(str(LR),
-                            "_B" + str(batch_size) + "_F" + str(number_of_frames) + "_S" + "_G" + str(gamma) + "_Step" + str(step_size))))))
+    best_model_path = model_to_store #os.path.join("models", os.path.join(model_name, os.path.join(str(num_views), os.path.join(pre_model, os.path.join(str(LR),
+                            #"_B" + str(batch_size) + "_F" + str(number_of_frames) + "_S" + "_G" + str(gamma) + "_Step" + str(step_size))))))
 
 
     log_path = os.path.join(best_model_path, "logging.log")
@@ -126,7 +134,6 @@ def main(*args):
                                           ])
     else:
         transformAug = None
-
     if pre_model == "r3d_18":
         transforms_model = R3D_18_Weights.KINETICS400_V1.transforms()        
     elif pre_model == "s3d":
@@ -136,7 +143,10 @@ def main(*args):
     elif pre_model == "r2plus1d_18":
         transforms_model = R2Plus1D_18_Weights.KINETICS400_V1.transforms()
     elif pre_model == "mvit_v2_s":
-        transforms_model = MViT_V2_S_Weights.KINETICS400_V1.transforms()
+        transforms_model = transforms.Compose([
+            transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
+            transforms.CenterCrop([224, 224])
+        ]) #MViT_V2_S_Weights.KINETICS400_V1.transforms()
     else:
         transforms_model = R2Plus1D_18_Weights.KINETICS400_V1.transforms()
         print("Warning: Could not find the desired pretrained model")
@@ -195,7 +205,13 @@ def main(*args):
     ###################################
     #       LOADING THE MODEL         #
     ###################################
-    model = MVNetwork(net_name=pre_model, agr_type=pooling_type).cuda()
+    
+    if args.multi_gpu:
+        model = MVNetwork(net_name=pre_model, agr_type=pooling_type)
+        model = nn.DataParallel(model)
+        model.cuda()
+    else :
+        model = MVNetwork(net_name=pre_model, agr_type=pooling_type).cuda()
 
     if path_to_model_weights != "":
         path_model = os.path.join(path_to_model_weights)
@@ -304,6 +320,9 @@ if __name__ == '__main__':
     parser.add_argument("--step_size", required=False, type=int, default=3, help="StepLR parameter")
     parser.add_argument("--gamma", required=False, type=float, default=0.1, help="StepLR parameter")
     parser.add_argument("--weight_decay", required=False, type=float, default=0.001, help="Weight decacy")
+    parser.add_argument("--multi_gpu", action='store_true', help="Enable multigpu mode")
+    parser.add_argument("--model_to_store", required=False, type=str, default="", help="path to store the model weights")
+    
 
     parser.add_argument("--only_evaluation", required=False, type=int, default=3, help="Only evaluation, 0 = on test set, 1 = on chall set, 2 = on both sets and 3 = train/valid/test")
     parser.add_argument("--path_to_model_weights", required=False, type=str, default="", help="Path to the model weights")
@@ -313,10 +332,20 @@ if __name__ == '__main__':
     ## Checking if arguments are valid
     checkArguments()
 
-    # Setup the GPU
+    # Setup the GPU -> not working; must be written before torch is initialized
+    """
     if args.GPU >= 0:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.GPU)
+        print(f'cuda: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+    """
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f'CUDA_VISIBLE_DEVICES: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+    print(f'Available CUDA devices: {torch.cuda.device_count()}')
+    print(f'Current device index: {torch.cuda.current_device()}')
+    print(f'Current device name: {torch.cuda.get_device_name(device)}')
 
 
     # Start the main training function
