@@ -3,8 +3,11 @@ import torch
 from torch import nn
 import einops
 from .rtmo import RTMOBackbone
+from .graph_utils import generate_intra_spatial_edge, generate_inter_spatial_edge, visualize_graph
+from .head import MultiScaleTransformerHead
 import numpy as np
 import torchvision.transforms as transforms
+
 
 class ConvModule(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, groups=1):
@@ -17,7 +20,7 @@ class ConvModule(nn.Module):
         return self.activate(self.bn(self.conv(x)))
 
 class RTMOHead(nn.Module):
-    def __init__(self, feat_dim):
+    def __init__(self, feat_dim,):
         super(RTMOHead, self).__init__()
         # torch.Size([B*V*16, 512, 40, 40]) torch.Size([B*V*D, 512, 20, 20])
         self.conv_feat_1 = nn.Sequential(
@@ -53,6 +56,8 @@ class RTMOHead(nn.Module):
         x = self.frame_linear(x)
         
         return x
+    
+
 
 class WeightedAggregate(nn.Module):
     def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential()):
@@ -64,11 +69,10 @@ class WeightedAggregate(nn.Module):
             transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
         ])
 
-        self.pose_head = RTMOHead(feat_dim=feat_dim)
+        self.pose_head = MultiScaleTransformerHead(feat_dim=feat_dim)
         self.fuselinear = nn.Linear(2*feat_dim, feat_dim)
 
         self.lifting_net = lifting_net
-        num_heads = 8
         self.feature_dim = feat_dim
 
         r1 = -1
@@ -84,8 +88,112 @@ class WeightedAggregate(nn.Module):
 
 
     def forward(self, mvimages):
+        self.pose_model.model.head.dcc.pose_to_kpts.eval() # to avoid BatchNorm1d Bug
+
         B, V, C, D, H, W = mvimages.shape # Batch, Views, Channel, Depth, Height, Width # 2 2 3 16 224 224 # depth == frame num
+
+        ## transform for MViT input 
+        mvimages_mvit_transform = einops.rearrange(mvimages, 'B V C D H W -> B V D C H W') # to apply transformation for MViT (B T C H W)
+        mvimages_mvit_transform = mvimages_mvit_transform.float() / 255.0 # to scaling [0,1]
+        for b in range(B):
+            for v in range(V):
+                for d in range(D): 
+                    mvimages_mvit_transform[b,v,d,:] = self.MViT_transform(mvimages_mvit_transform[b,v,d,:])
+
+        mvimages_mvit_transform = einops.rearrange(mvimages_mvit_transform, 'B V D C H W -> B V C D H W')
+        ## transformation done 
+
+        # MViT output 
+        aux = self.lifting_net(unbatch_tensor(self.model(batch_tensor(mvimages_mvit_transform, dim=1, squeeze=True)), B, dim=1, unsqueeze=True))
+
+        # RTMO output 
+        # torch.Size([BVT, H, W, C]) torch.Size([BVT, H/2, W/2, C])
+        pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) H W C')
+        pose_input = pose_input.cpu().numpy()
+        pose_results = [None, None]
+        for i in range(B*V*D):
+            result = self.pose_model(pose_input[i])
+            if pose_results[0] is None:
+                pose_results[0] = result[0]
+                pose_results[1] = result[1]
+            else :
+                pose_results[0] = torch.cat([pose_results[0], result[0]], dim=0)
+                pose_results[1] = torch.cat([pose_results[1], result[1]], dim=0)
+
         
+        # Transform to torch.Size([BV, 16, 512, 40, 40]) 
+        for i, _ in enumerate(pose_results):
+            pose_results[i] = einops.rearrange(pose_results[i], '(b v t) c h w -> (b v) t h w c', b=B,v=V,t=D)        
+      
+        # pose_head input: (BV, t h w c), output: (BV, feat_dim)
+        pose_result = self.pose_head(pose_results)
+        pose_result = einops.rearrange(pose_result, '(b v) f -> b v f', b=B, v=V)
+
+        #aux = pose_result
+        aux = self.fuselinear(torch.cat([aux, pose_result],dim=-1))
+
+        ##################### VIEW ATTENTION #####################
+
+        # S = source length 
+        # N = batch size
+        # E = embedding dimension
+        # L = target length
+
+        aux = torch.matmul(aux, self.attention_weights)
+        # Dimension S, E for two views (2,512)
+
+        # Dimension N, S, E
+        aux_t = aux.permute(0, 2, 1)
+
+        prod = torch.bmm(aux, aux_t)
+        relu_res = self.relu(prod)
+        
+        aux_sum = torch.sum(torch.reshape(relu_res, (B, V*V)).T, dim=0).unsqueeze(0)
+        final_attention_weights = torch.div(torch.reshape(relu_res, (B, V*V)).T, aux_sum.squeeze(0))
+        final_attention_weights = final_attention_weights.T
+
+        final_attention_weights = torch.reshape(final_attention_weights, (B, V, V))
+
+        final_attention_weights = torch.sum(final_attention_weights, 1)
+
+        output = torch.mul(aux.squeeze(), final_attention_weights.unsqueeze(-1))
+
+        output = torch.sum(output, 1)
+
+        return output.squeeze(), final_attention_weights
+    
+class GraphAggregate(nn.Module):
+    def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential()):
+        super().__init__()
+        self.model = model
+        self.pose_model = pose_model
+
+        self.MViT_transform = transforms.Compose([
+            transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
+        ])
+
+        self.fuselinear = nn.Linear(2*feat_dim, feat_dim)
+
+        self.lifting_net = lifting_net
+        self.feature_dim = feat_dim
+
+        r1 = -1
+        r2 = 1
+        self.attention_weights = nn.Parameter((r1 - r2) * torch.rand(feat_dim, feat_dim) + r2)
+
+        self.normReLu = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.ReLU()
+        )        
+
+        self.relu = nn.ReLU()
+
+
+    def forward(self, mvimages):
+        self.pose_model.model.head.dcc.pose_to_kpts.eval() # to avoid BatchNorm1d Bug
+
+        B, V, C, D, H, W = mvimages.shape # Batch, Views, Channel, Depth, Height, Width # 2 2 3 16 224 224 # depth == frame num
+
         ## transform for MViT input 
         mvimages_mvit_transform = einops.rearrange(mvimages, 'B V C D H W -> B V D C H W') # to apply transformation for MViT (B T C H W)
         mvimages_mvit_transform = mvimages_mvit_transform.float() / 255.0 # to scaling [0,1]
@@ -98,29 +206,40 @@ class WeightedAggregate(nn.Module):
         ## transformation done 
 
         aux = self.lifting_net(unbatch_tensor(self.model(batch_tensor(mvimages_mvit_transform, dim=1, squeeze=True)), B, dim=1, unsqueeze=True))
-        #print(aux.shape) # 2 2 400
-        #print('batch: ', batch_tensor(mvimages, dim=1, squeeze=True).shape) # 4 3 16 224 224
         
         pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) H W C')
         pose_input = pose_input.cpu().numpy()
-        #self.pose_model.visualize(pose_input[2])
+        self.pose_model.visualize(pose_input[0])
+
         pose_results = [None, None]
         for i in range(B*V*D):
-            result = self.pose_model(pose_input[i])
-            if pose_results[0] is None:
-                pose_results[0] = result[0]
-                pose_results[1] = result[1]
-            else :
-                pose_results[0] = torch.cat([pose_results[0], result[0]], dim=0)
-                pose_results[1] = torch.cat([pose_results[1], result[1]], dim=0)
+            result = self.pose_model(pose_input[i])[0].pred_instances
+            
+            person_graph = []
+            keypoint_scores = torch.Tensor(result.keypoint_scores).unsqueeze(dim=2)
+            keypoints = torch.Tensor(result.keypoints)
+            keypoint_features = torch.cat([keypoints,keypoint_scores],dim=2) # (N, 14, 3)
+
+            for keypoint_feature in keypoint_features:
+                print('average confidence:', torch.sum(keypoint_feature[:,2])/14) 
+
+            for keypoint_feature in keypoint_features:
+                person_graph.append(generate_intra_spatial_edge(keypoint_feature))
+
+            frame_graph = generate_inter_spatial_edge(person_graph)
+
+            visualize_graph(frame_graph,'test/result_graph.jpg')
+            raise NotImplementedError
+
+            # (N, 14), (N, 14, 2), (N, 14)
+
 
         # torch.Size([32, 512, 40, 40]) torch.Size([32, 512, 20, 20])
         
-        
         # torch.Size([B, V, 16, 512, 40, 40]) torch.Size([32, 512, 20, 20])
         pose_result = self.pose_head((pose_results[0],pose_results[1]), view=V, batch=B, depth=D)
-        
-        aux = pose_result 
+
+        #aux = pose_result
         aux = self.fuselinear(torch.cat([aux, pose_result],dim=2))
 
         ##################### VIEW ATTENTION #####################
@@ -184,7 +303,15 @@ class MVAggregate(nn.Module):
     def __init__(self,  model, agr_type="max", feat_dim=400, lifting_net=nn.Sequential(), multi_gpu=False):
         super().__init__()
 
-        pose_model = RTMOBackbone(full_model=False) # only feature
+        ################### Setting for developer ######
+        use_graph = False
+        ################################################
+
+        if not use_graph:
+            pose_model = RTMOBackbone(full_model=False) # only feature
+        else:
+            pose_model = RTMOBackbone(full_model=True) # keypoints
+
         for param in pose_model.parameters():
             param.requires_grad = False
 
@@ -218,6 +345,8 @@ class MVAggregate(nn.Module):
             self.aggregation_model = ViewMaxAggregate(model=model, lifting_net=lifting_net)
         elif self.agr_type == "mean":
             self.aggregation_model = ViewAvgAggregate(model=model, lifting_net=lifting_net)
+        elif use_graph:
+            self.aggregation_model = GraphAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
         else:
             self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
 

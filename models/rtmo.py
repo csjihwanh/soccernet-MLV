@@ -12,6 +12,7 @@ from mmpose.apis.inferencers import MMPoseInferencer
 from mmpose.utils import register_all_modules
 from mmpose.registry import VISUALIZERS
 from mmpose.structures import merge_data_samples
+from mmpose.evaluation.functional import nearby_joints_nms, nms
 
 from mmpose.registry import VISUALIZERS
 
@@ -61,7 +62,7 @@ class RTMOBackbone(torch.nn.Module):
             'nms_thr': 0.65,  # setting for RTMO
             'pose_based_nms': True, # setting for RTMO
             'show_kpt_idx':False,
-            'kpt_thr': 0.5,
+            'kpt_thr': 0.65,
             'tracking_thr': 0.3,
             'use_oks_tracking': False,
             'disable_norm_pose_2d': False,
@@ -90,7 +91,44 @@ class RTMOBackbone(torch.nn.Module):
         
     def forward(self, x):
         if self.full_model:
-            return inference_bottomup(self.model, x)
+            result = inference_bottomup(self.model, x)
+            
+            # pose based nms 
+            # reference: https://github.com/open-mmlab/mmpose/blob/main/mmpose/apis/inferencers/pose2d_inferencer.py
+            print('before :', len(result[0].pred_instances))
+            for ds in result:
+                if len(ds.pred_instances) == 0:
+                    continue
+
+                kpts = ds.pred_instances.keypoints
+                scores = ds.pred_instances.bbox_scores
+                num_keypoints = kpts.shape[-2]
+
+                kept_indices = nearby_joints_nms(
+                    [
+                        dict(keypoints=kpts[i], score=scores[i])
+                        for i in range(len(kpts))
+                    ],
+                    num_nearby_joints_thr=num_keypoints // 3,
+                )
+                ds.pred_instances = ds.pred_instances[kept_indices]
+            print('nms :', len(result[0].pred_instances))
+            # keypoint threshold filtering 
+            kpt_threshold = self.call_setting['kpt_thr']
+            for ds in result:
+                if len(ds.pred_instances) == 0:
+                    continue
+
+                kpt_scores = ds.pred_instances.keypoint_scores  
+                kpt_scores_avg = np.mean(kpt_scores, axis=-1)  
+
+                kept_indices = np.where(kpt_scores_avg > kpt_threshold)[0]
+
+                ds.pred_instances = ds.pred_instances[kept_indices]
+            print('thresholding :', len(result[0].pred_instances))
+
+            return result
+        
         else:
             hook_handle = self.model.neck.register_forward_hook(self.get_neck_output_hook)
             result = inference_bottomup(self.model, x)
@@ -115,7 +153,7 @@ class RTMOBackbone(torch.nn.Module):
                 show_kpt_idx=self.call_setting['show_kpt_idx'],
                 show=self.call_setting['show'],
                 wait_time=self.call_setting['show_interval'],
-                kpt_thr=self.call_setting['kpt_thr']
+                kpt_thr=self.call_setting['kpt_thr'],
             )
             img_vis = self.visualizer.get_image()
             mmcv.imwrite(mmcv.rgb2bgr(img_vis), 'test/result.jpg')

@@ -28,6 +28,10 @@ pip install -r requirements.txt
 
 pip install pyav
 
+pip install torch_geometric
+
+pip install networkx
+
 
 ## Weights
 
