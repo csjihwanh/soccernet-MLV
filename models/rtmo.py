@@ -9,12 +9,15 @@ from mmpose.apis import inference_bottomup, init_model
 from mmengine.config import Config, ConfigDict
 from mmengine.structures import InstanceData
 from mmpose.apis.inferencers import MMPoseInferencer
+from mmengine.dataset import Compose, pseudo_collate
 from mmpose.utils import register_all_modules
 from mmpose.registry import VISUALIZERS
 from mmpose.structures import merge_data_samples
 from mmpose.evaluation.functional import nearby_joints_nms, nms
 
 from mmpose.registry import VISUALIZERS
+
+import torch.nn as nn 
 
 try:
     from mmdet.apis import inference_detector, init_detector
@@ -39,12 +42,58 @@ ImgType = Union[np.ndarray, Sequence[np.ndarray]]
 ConfigType = Union[Config, ConfigDict]
 ResType = Union[Dict, List[Dict], InstanceData, List[InstanceData]]
 
+def inference_bottomup_modified(model: nn.Module, img: Union[np.ndarray, str]):
+    """Inference image with a bottom-up pose estimator.
+
+    Args:
+        model (nn.Module): The bottom-up pose estimator
+        img (np.ndarray | str): The loaded image or image file to inference
+
+    Returns:
+        List[:obj:`PoseDataSample`]: The inference results. Specifically, the
+        predicted keypoints and scores are saved at
+        ``data_sample.pred_instances.keypoints`` and
+        ``data_sample.pred_instances.keypoint_scores``.
+    """
+    pipeline = Compose(model.cfg.test_dataloader.dataset.pipeline)
+    # prepare data batch
+    if isinstance(img, str):
+        data_info = dict(img_path=img)
+    else:
+        data_info = dict(img=img)
+    data_info.update(model.dataset_meta)
+    data = pipeline(data_info)
+    batch = pseudo_collate([data])
+
+    #model.data_preprocessor.batch_augments.cuda()
+
+    results = model.test_step(batch)
+
+    return results
+
 class RTMOBackbone(torch.nn.Module):
-    def __init__(self, device='cuda', full_model = False):
+    def __init__(self, device='cuda', full_model = False, full_model_weight=False, mode='tiny'):
         super().__init__()
+        
+        rtmo_t_cfg = 'config/rtmo-t_8xb32-600e_body7-416x416.py'
+        rtmo_s_cfg = 'config/rtmo-s_8xb32-600e_body7-640x640.py'
+        rtmo_l_cfg = 'config/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py'
+        
+        rtmo_t_weight = 'checkpoints/rtmo-t_8xb32-600e_body7-416x416-f48f75cb_20231219.pth'
+        rtmo_s_weight = 'checkpoints/rtmo-s_8xb32-600e_body7-640x640-dac2bf74_20231211.pth'
+        rtmo_l_weight = 'checkpoints/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth'
+        
+        if mode == 'tiny':
+            cfg = rtmo_t_cfg
+            weight = rtmo_t_weight
+        if mode == 'small':
+            cfg = rtmo_s_cfg
+            weight = rtmo_s_weight
+
+
         self.init_setting = {
-            'pose2d': 'config/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py',
-            'pose2d_weights': 'checkpoints/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth',
+            'pose2d': cfg,
+            'pose2d_weights': weight,
             'pose3d': None,
             'pose3d_weights': None,
             'det_model': None,
@@ -54,6 +103,9 @@ class RTMOBackbone(torch.nn.Module):
             'device': device,
             'show_progress': False,
         }
+        if full_model_weight:
+            self.init_setting['pose2d_weights']=None
+
         self.call_setting = {
             'show': False,
             'draw_bbox': False,
@@ -80,6 +132,8 @@ class RTMOBackbone(torch.nn.Module):
 
         self.full_model = full_model
 
+        print('rtmo init')
+
         rtmo = init_model(self.init_setting['pose2d'], self.init_setting['pose2d_weights'], device=self.init_setting['device'])
         self.model = rtmo
 
@@ -91,7 +145,7 @@ class RTMOBackbone(torch.nn.Module):
         
     def forward(self, x):
         if self.full_model:
-            result = inference_bottomup(self.model, x)
+            result = inference_bottomup_modified(self.model, x)
             
             # pose based nms 
             # reference: https://github.com/open-mmlab/mmpose/blob/main/mmpose/apis/inferencers/pose2d_inferencer.py
@@ -131,7 +185,7 @@ class RTMOBackbone(torch.nn.Module):
         
         else:
             hook_handle = self.model.neck.register_forward_hook(self.get_neck_output_hook)
-            result = inference_bottomup(self.model, x)
+            result = inference_bottomup_modified(self.model, x)
             return neck_output
         
     def visualize(self, x):

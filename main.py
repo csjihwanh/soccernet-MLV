@@ -7,7 +7,7 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from SoccerNet.Evaluation.MV_FoulRecognition import evaluate
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = str('4')
+os.environ["CUDA_VISIBLE_DEVICES"] = str('1,2,3,6,7')
 
 import torch
 from datasets.dataset import MultiViewDataset
@@ -23,6 +23,22 @@ from torchvision.models.video import R2Plus1D_18_Weights, S3D_Weights
 from torchvision.models.video import MViT_V2_S_Weights, MViT_V1_B_Weights
 from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights, mvit_v1_b, MViT_V1_B_Weights
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    CPUOffload,
+    ShardingStrategy,
+)
+from torch.distributed.fsdp.wrap import (
+   size_based_auto_wrap_policy,
+   
+)
+
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 def checkArguments():
 
@@ -96,9 +112,25 @@ def main(*args):
         only_evaluation = args.only_evaluation
         path_to_model_weights = args.path_to_model_weights
         model_to_store = args.model_to_store
+        multi_gpu = args.multi_gpu
+        fsdp = args.fsdp
     else:
         print("EXIT")
         exit()
+
+    ## fdsp ddp setting 
+    if fsdp:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        setup(rank, world_size)
+        torch.cuda.set_device(local_rank)
+
+    
+    print(f'CUDA_VISIBLE_DEVICES: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+    print(f'Available CUDA devices: {torch.cuda.device_count()}')
+    print(f'Current device index: {torch.cuda.current_device()}')
+    print(f'Current device name: {torch.cuda.get_device_name(device)}')
 
     # Logging information
     numeric_level = getattr(logging, 'INFO'.upper(), None)
@@ -153,6 +185,12 @@ def main(*args):
         print("Possible options are: r3d_18, s3d, mc3_18, mvit_v2_s and r2plus1d_18")
         print("We continue with r2plus1d_18")
     
+    # for fsdp
+    dataset_Test2 =None
+    dataset_Chall =None
+    dataset_Train=None
+    dataset_Valid2=None
+
     if only_evaluation == 0:
         dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views = 5, 
         transform_model=transforms_model)
@@ -201,22 +239,50 @@ def main(*args):
         test_loader2 = torch.utils.data.DataLoader(dataset_Test2,
             batch_size=1, shuffle=False,
             num_workers=max_num_worker, pin_memory=True)
+    
+    train_sampler = None
+    valid_sampler = None
+    test_sampler = None
+    chall_sampler = None
+    if fsdp:
+        if dataset_Train is not None:
+            train_sampler = DistributedSampler(dataset_Train, rank=rank, num_replicas=world_size, shuffle=True)
+        if dataset_Valid2 is not None:
+            valid_sampler = DistributedSampler(dataset_Valid2, rank=rank, num_replicas=world_size)
+        if dataset_Test2 is not None:
+            test_sampler = DistributedSampler(dataset_Test2, rank=rank, num_replicas=world_size)
+        if dataset_Chall is not None:
+            chall_sampler = DistributedSampler(dataset_Chall, rank=rank, num_replicas=world_size)
 
     ###################################
     #       LOADING THE MODEL         #
     ###################################
-    
-    if args.multi_gpu:
-        model = MVNetwork(net_name=pre_model, agr_type=pooling_type)
-        model = nn.DataParallel(model)
-        model.cuda()
-    else :
-        model = MVNetwork(net_name=pre_model, agr_type=pooling_type).cuda()
+    print(f"VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
+    model = MVNetwork(net_name=pre_model, agr_type=pooling_type, multi_gpu=args.multi_gpu, device=device).cpu()
+
+    print(f"VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
+        
     if path_to_model_weights != "":
         path_model = os.path.join(path_to_model_weights)
         load = torch.load(path_model)
+        print('load MViT model...')
         model.load_state_dict(load['state_dict'], strict=False)
+    
+    if args.fsdp:
+
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=size_based_auto_wrap_policy,
+            cpu_offload=CPUOffload(offload_params=True),
+        )
+    else:
+        model = model.cuda()
+
+    print(f"VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
 
     if only_evaluation == 3:
 
@@ -291,9 +357,17 @@ def main(*args):
         print(results)
     else:
         trainer(train_loader, val_loader2, test_loader2, model, optimizer, scheduler, criterion, 
-                best_model_path, epoch_start, model_name=model_name, path_dataset=path, max_epochs=max_epochs)
-        
+                best_model_path, epoch_start, model_name=model_name, path_dataset=path, max_epochs=max_epochs, fsdp=fsdp, sampler=(train_sampler, valid_sampler, test_sampler, chall_sampler))
     return 0
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 
@@ -321,8 +395,11 @@ if __name__ == '__main__':
     parser.add_argument("--gamma", required=False, type=float, default=0.1, help="StepLR parameter")
     parser.add_argument("--weight_decay", required=False, type=float, default=0.001, help="Weight decacy")
     parser.add_argument("--multi_gpu", action='store_true', help="Enable multigpu mode")
+    parser.add_argument("--fsdp", action='store_true', help="Enable fsdp mode")
     parser.add_argument("--model_to_store", required=False, type=str, default="", help="path to store the model weights")
-    
+    #parser.add_argument('--rank',   required=False, type=int,   default=60,     help='rank' )
+    #parser.add_argument('--world_size',   required=False, type=int,   default=60,   help='world_size' )
+
 
     parser.add_argument("--only_evaluation", required=False, type=int, default=3, help="Only evaluation, 0 = on test set, 1 = on chall set, 2 = on both sets and 3 = train/valid/test")
     parser.add_argument("--path_to_model_weights", required=False, type=str, default="", help="Path to the model weights")
@@ -342,14 +419,14 @@ if __name__ == '__main__':
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f'CUDA_VISIBLE_DEVICES: {os.environ["CUDA_VISIBLE_DEVICES"]}')
-    print(f'Available CUDA devices: {torch.cuda.device_count()}')
-    print(f'Current device index: {torch.cuda.current_device()}')
-    print(f'Current device name: {torch.cuda.get_device_name(device)}')
 
 
     # Start the main training function
     start=time.time()
     logging.info('Starting main function')
+    
     main(args, False)
     logging.info(f'Total Execution Time is {time.time()-start} seconds')
+
+    if args.fsdp:
+        cleanup()

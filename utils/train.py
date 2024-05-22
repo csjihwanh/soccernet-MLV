@@ -7,6 +7,7 @@ from config.classes import INVERSE_EVENT_DICTIONARY
 import json
 from SoccerNet.Evaluation.MV_FoulRecognition import evaluate
 from tqdm import tqdm
+import torch.distributed as dist
 
 def trainer(train_loader,
             val_loader2,
@@ -20,18 +21,25 @@ def trainer(train_loader,
             model_name,
             path_dataset,
             max_epochs=1000,
+            rank=None,
+            world_size=None,
+            fsdp=False,
+            sampler = (None,None,None,None),
             ):
     
+    train_sampler, valid_sampler, test_sampler, chall_sampler = sampler
 
     logging.info("start training")
     counter = 0
+
 
     for epoch in range(epoch_start, max_epochs):
 
         print(f"Epoch {epoch+1}/{max_epochs}")
     
         # Create a progress bar
-        pbar = tqdm(total=len(train_loader), desc="Training", position=0, leave=True)
+        if rank == 0 or rank is None:
+            pbar = tqdm(total=len(train_loader), desc="Training", position=0, leave=True)
 
         ###################### TRAINING ###################
         prediction_file, loss_action, loss_offence_severity = train(
@@ -44,6 +52,9 @@ def trainer(train_loader,
             train=True,
             set_name="train",
             pbar=pbar,
+            rank=rank,
+            world_size=world_size,
+            sampler = train_sampler 
         )
 
         results = evaluate(os.path.join(path_dataset, "Train", "annotations.json"), prediction_file)
@@ -59,7 +70,10 @@ def trainer(train_loader,
             epoch + 1,
             model_name,
             train = False,
-            set_name="valid"
+            set_name="valid",
+            rank=rank,
+            world_size=world_size,
+            sampler = valid_sampler
         )
 
         results = evaluate(os.path.join(path_dataset, "Valid", "annotations.json"), prediction_file)
@@ -77,6 +91,9 @@ def trainer(train_loader,
                 model_name,
                 train=False,
                 set_name="test",
+                rank=rank,
+                world_size=world_size,
+                sampler = test_sampler
             )
 
         results = evaluate(os.path.join(path_dataset, "Test", "annotations.json"), prediction_file)
@@ -112,6 +129,9 @@ def train(dataloader,
           set_name="train",
           pbar=None,
           GPU=0,
+          rank=None,
+          world_size=None,
+          sampler=None,
         ):
     
 
@@ -136,10 +156,18 @@ def train(dataloader,
     actions = {}
 
     if True:
+        if sampler:
+            sampler.set_epoch(epoch)
+
         for targets_offence_severity, targets_action, mvclips, action in dataloader:
             targets_offence_severity = targets_offence_severity.cuda()
             targets_action = targets_action.cuda()
             mvclips = mvclips.cuda().float()
+
+            if rank:
+                targets_offence_severity = targets_offence_severity.to(rank)
+                targets_action = targets_action.to(rank)
+                mvclips = mvclips.to(rank)
 
             if pbar is not None:
                 pbar.update()
@@ -208,7 +236,8 @@ def train(dataloader,
             loss_total_action += float(loss_action)
             loss_total_offence_severity += float(loss_offence_severity)
             total_loss += 1
-          
+            
+    
         gc.collect()
         torch.cuda.empty_cache()
         #torch.save(model.state_dict(), f'/hub_data1/intern/soccernet-pose/checkpoints/model{epoch}.pth')

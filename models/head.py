@@ -11,56 +11,39 @@ import numpy as np
 
 
 class MultiScaleTransformerHead(nn.Module):
-    def __init__(self, feat_dim):
+    def __init__(self, feat_dim, multi_gpu=False, mode='tiny'):
         super(MultiScaleTransformerHead, self).__init__()
         
-        self.blocks_1 = nn.ModuleList()
-        self.blocks_2 = nn.ModuleList()
+        self.blocks = nn.ModuleList()
 
-        self.blocks_1.extend([
-            SpatioTemporalBlock(
-                input_size = (16,40,40,512),
-                output_size = (8,20,20,feat_dim),
-                in_channels=512,
-                out_channels=feat_dim,
-                kernel_size= 4,
-                stride = 2,
-                padding=1,
-                num_heads=16
-            ),
-            SpatioTemporalBlock(
-                input_size = (8,20,20,feat_dim),
-                output_size = (4,10,10,feat_dim),
-                in_channels=feat_dim,
-                out_channels=feat_dim,
-                kernel_size= 4,
-                stride = 2,
-                padding=1,
-                num_heads=16
-            ),
-            SpatioTemporalBlock(
-                input_size = (4,10,10,feat_dim),
-                output_size = (4,4,4,feat_dim),
-                in_channels=feat_dim,
+        if mode == 'tiny':
+            input_dim = 192
+            first_module = SpatioTemporalBlock(
+                input_size = (16,12,12,input_dim),
+                output_size = (8,10,10,feat_dim),
+                in_channels=input_dim,
                 out_channels=feat_dim,
                 kernel_size= 3,
-                stride = [1,3,3],
-                padding= 1,
+                stride = 1,
+                padding=0,
                 num_heads=16
-            ),
-        ])
+            )
 
-        self.blocks_2.extend([
-            SpatioTemporalBlock(
-                input_size = (16,20,20,512),
+        elif mode == 'small':
+            input_dim = 256
+            first_module = SpatioTemporalBlock(
+                input_size = (16,20,20,input_dim),
                 output_size = (8,10,10,feat_dim),
-                in_channels=512,
+                in_channels=input_dim,
                 out_channels=feat_dim,
                 kernel_size= 4,
                 stride = 2,
                 padding=1,
                 num_heads=16
-            ),
+            )
+
+        self.blocks.extend([
+            first_module,
             SpatioTemporalBlock(
                 input_size = (8,10,10,feat_dim),
                 output_size = (4,4,4,feat_dim),
@@ -83,43 +66,27 @@ class MultiScaleTransformerHead(nn.Module):
             ),
         ])
         self.maxpool3d = torch.nn.MaxPool3d(4, stride=1, padding=0, dilation=1)
-        self.fuseLinear = nn.Linear(feat_dim*2, feat_dim)
+        self.maxpool2d = torch.nn.MaxPool3d(3, stride=[2, 2, 1], padding=1, dilation=1)
 
     def forward(
             self, 
             x: Tuple[torch.Tensor, torch.Tensor],
         )-> torch.Tensor:
 
-        y = None
+        x = torch.stack([self.maxpool2d(x[0]), x[1]], dim=-1)
+        x, _ = x.max(dim=-1)
 
-        for i in range(len(x)):
             
-            x_i = x[i]
-            modules = None
-            if i == 0:
-                modules = self.blocks_1
-            elif i == 1:
-                modules = self.blocks_2
-            else :
-                raise RuntimeError
-            
-            for module in modules:
-                BV,T,H,W,C = x_i.shape
-                x_i = module(x_i, (T,H,W))
-            
-            x_i = einops.rearrange(x_i, 'b t h w c-> b c t h w')
-            x_i = self.maxpool3d(x_i)
-            x_i = einops.rearrange(x_i, 'b c t h w -> b t h w c')
-            x_i = x_i.squeeze()
+        for module in self.blocks:
+            BV,T,H,W,C = x.shape
+            x = module(x, (T,H,W))
+        
+        x = einops.rearrange(x, 'b t h w c-> b c t h w')
+        x = self.maxpool3d(x)
+        x = einops.rearrange(x, 'b c t h w -> b t h w c')
+        x = x.squeeze()
 
-            if y is None:
-                y = x_i
-            else :
-                y = torch.cat([y,x_i],dim=-1)
-
-        y = self.fuseLinear(y)
-
-        return y
+        return x
 
 def _interpolate(embedding: torch.Tensor, d: int) -> torch.Tensor:
     # code reference: https://pytorch.org/vision/main/_modules/torchvision/models/video/mvit.html#mvit_v2_s 
@@ -221,7 +188,7 @@ class SpatioTemporalPooling(nn.Module):
         x = x.reshape((B* num_heads, head_dim) + thw)
 
         x = self.pooling(x)
-
+        
         t, h, w = x.shape[2:]
         x = x.reshape(B, num_heads, head_dim, -1)
         x = x.transpose(2,3)
@@ -244,7 +211,7 @@ class SpatioTemporalAttention(nn.Module):
 
         self.head_dim = out_channels // num_heads
         assert self.head_dim * num_heads == out_channels, \
-            "embed_dim must be divisible by num_heads"
+            f"embed_dim must be divisible by num_heads, {self.head_dim, num_heads, out_channels}"
         
         self.in_channels = in_channels
         self.out_channels = out_channels

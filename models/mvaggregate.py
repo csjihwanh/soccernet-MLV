@@ -2,7 +2,6 @@ from utils.utils import batch_tensor, unbatch_tensor
 import torch
 from torch import nn
 import einops
-from .rtmo import RTMOBackbone
 from .graph_utils import generate_intra_spatial_edge, generate_inter_spatial_edge, visualize_graph
 from .head import MultiScaleTransformerHead
 import numpy as np
@@ -58,18 +57,20 @@ class RTMOHead(nn.Module):
         return x
     
 
-
 class WeightedAggregate(nn.Module):
-    def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential()):
+    def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential(), multi_gpu=False, only_rtmo =False, mode='tiny'):
         super().__init__()
         self.model = model
         self.pose_model = pose_model
+        self.multi_gpu = multi_gpu
+        self.only_rtmo = only_rtmo
 
         self.MViT_transform = transforms.Compose([
             transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
         ])
 
-        self.pose_head = MultiScaleTransformerHead(feat_dim=feat_dim)
+        self.pose_head = MultiScaleTransformerHead(feat_dim=feat_dim, multi_gpu=multi_gpu, mode=mode).cuda()
+
         self.fuselinear = nn.Linear(2*feat_dim, feat_dim)
 
         self.lifting_net = lifting_net
@@ -86,9 +87,14 @@ class WeightedAggregate(nn.Module):
 
         self.relu = nn.ReLU()
 
+        if multi_gpu:
+            self.model = self.model.to('cuda:0')
+            self.pose_model.data_preprocessor = self.pose_model.data_preprocessor.to('cuda:1')
+            self.pose_head = self.pose_head.to('cuda:2')
+            
 
     def forward(self, mvimages):
-        self.pose_model.model.head.dcc.pose_to_kpts.eval() # to avoid BatchNorm1d Bug
+        #self.pose_model.model.head.dcc.pose_to_kpts.eval() # to avoid BatchNorm1d Bug
 
         B, V, C, D, H, W = mvimages.shape # Batch, Views, Channel, Depth, Height, Width # 2 2 3 16 224 224 # depth == frame num
 
@@ -104,13 +110,17 @@ class WeightedAggregate(nn.Module):
         ## transformation done 
 
         # MViT output 
-        aux = self.lifting_net(unbatch_tensor(self.model(batch_tensor(mvimages_mvit_transform, dim=1, squeeze=True)), B, dim=1, unsqueeze=True))
+        if not self.only_rtmo :
+            aux = self.lifting_net(unbatch_tensor(self.model(batch_tensor(mvimages_mvit_transform, dim=1, squeeze=True)), B, dim=1, unsqueeze=True))
 
         # RTMO output 
         # torch.Size([BVT, H, W, C]) torch.Size([BVT, H/2, W/2, C])
+       
         pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) H W C')
         pose_input = pose_input.cpu().numpy()
         pose_results = [None, None]
+
+
         for i in range(B*V*D):
             result = self.pose_model(pose_input[i])
             if pose_results[0] is None:
@@ -120,17 +130,19 @@ class WeightedAggregate(nn.Module):
                 pose_results[0] = torch.cat([pose_results[0], result[0]], dim=0)
                 pose_results[1] = torch.cat([pose_results[1], result[1]], dim=0)
 
-        
+    
         # Transform to torch.Size([BV, 16, 512, 40, 40]) 
         for i, _ in enumerate(pose_results):
             pose_results[i] = einops.rearrange(pose_results[i], '(b v t) c h w -> (b v) t h w c', b=B,v=V,t=D)        
-      
+
         # pose_head input: (BV, t h w c), output: (BV, feat_dim)
         pose_result = self.pose_head(pose_results)
         pose_result = einops.rearrange(pose_result, '(b v) f -> b v f', b=B, v=V)
 
-        #aux = pose_result
-        aux = self.fuselinear(torch.cat([aux, pose_result],dim=-1))
+        if self.only_rtmo :
+            aux = pose_result
+        elif not self.only_rtmo: 
+            aux = self.fuselinear(torch.cat([aux, pose_result],dim=-1))
 
         ##################### VIEW ATTENTION #####################
 
@@ -300,19 +312,11 @@ class ViewAvgAggregate(nn.Module):
 
 
 class MVAggregate(nn.Module):
-    def __init__(self,  model, agr_type="max", feat_dim=400, lifting_net=nn.Sequential(), multi_gpu=False):
+    def __init__(self,  model, pose_model, agr_type="max", feat_dim=400, lifting_net=nn.Sequential(), multi_gpu=False, use_graph=False, only_rtmo=False, mode='tiny'):
         super().__init__()
 
-        ################### Setting for developer ######
-        use_graph = False
-        ################################################
 
-        if not use_graph:
-            pose_model = RTMOBackbone(full_model=False) # only feature
-        else:
-            pose_model = RTMOBackbone(full_model=True) # keypoints
-
-        for param in pose_model.parameters():
+        for param in pose_model.model.neck.parameters():
             param.requires_grad = False
 
         for param in model.parameters():
@@ -348,7 +352,7 @@ class MVAggregate(nn.Module):
         elif use_graph:
             self.aggregation_model = GraphAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
         else:
-            self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
+            self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model, multi_gpu=multi_gpu, only_rtmo=only_rtmo, mode=mode)
 
     def check_dim(self, tensor):
         if tensor.dim() == 1:
@@ -364,10 +368,11 @@ class MVAggregate(nn.Module):
         pred_action = self.fc_action(inter)
         pred_offence_severity = self.fc_offence(inter)
 
-        if self.multi_gpu:
-            inter = self.check_dim(inter)
-            pred_action = self.check_dim(pred_action)
-            pred_offence_severity = self.check_dim(pred_offence_severity)
+        #if self.multi_gpu:
+            #inter = self.check_dim(inter)
+            #pred_action = self.check_dim(pred_action)
+            #print('dimension unsqueeze')
+            #pred_offence_severity = self.check_dim(pred_offence_severity)
 
         #print("output shape:", pred_offence_severity.shape, pred_action.shape, attention.shape)
         # output shape: torch.Size([2, 4]) torch.Size([2, 8]) torch.Size([2, 2])
