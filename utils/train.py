@@ -231,6 +231,16 @@ def train(dataloader,
                 # compute gradient and do SGD step
                 optimizer.zero_grad()
                 loss.backward()
+
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        if param.grad is not None:
+                            print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient: {param.grad.shape}")
+                        else:
+                            print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient is None (potential issue)")
+                    else:
+                        print(f"Parameter: {name} does not require gradients")
+
                 optimizer.step()
 
             loss_total_action += float(loss_action)

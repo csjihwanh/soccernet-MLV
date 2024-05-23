@@ -6,6 +6,7 @@ from .graph_utils import generate_intra_spatial_edge, generate_inter_spatial_edg
 from .head import MultiScaleTransformerHead
 import numpy as np
 import torchvision.transforms as transforms
+from .rtmo import visualize_tensor
 
 
 class ConvModule(nn.Module):
@@ -89,8 +90,6 @@ class WeightedAggregate(nn.Module):
 
         if multi_gpu:
             self.model = self.model.to('cuda:0')
-            self.pose_model.data_preprocessor = self.pose_model.data_preprocessor.to('cuda:1')
-            self.pose_head = self.pose_head.to('cuda:2')
             
 
     def forward(self, mvimages):
@@ -115,28 +114,15 @@ class WeightedAggregate(nn.Module):
 
         # RTMO output 
         # torch.Size([BVT, H, W, C]) torch.Size([BVT, H/2, W/2, C])
-       
-        pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) H W C')
-        pose_input = pose_input.cpu().numpy()
-        pose_results = [None, None]
 
+        pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) C H W')
 
-        for i in range(B*V*D):
-            result = self.pose_model(pose_input[i])
-            if pose_results[0] is None:
-                pose_results[0] = result[0]
-                pose_results[1] = result[1]
-            else :
-                pose_results[0] = torch.cat([pose_results[0], result[0]], dim=0)
-                pose_results[1] = torch.cat([pose_results[1], result[1]], dim=0)
-
-    
-        # Transform to torch.Size([BV, 16, 512, 40, 40]) 
-        for i, _ in enumerate(pose_results):
-            pose_results[i] = einops.rearrange(pose_results[i], '(b v t) c h w -> (b v) t h w c', b=B,v=V,t=D)        
+        pose_input = pose_input.flip([1]) # from rgb to bgr (rtmo gets cv2 image) -> c, h, w
+        print(pose_input.shape)
+        pose_result = self.pose_model(pose_input)
 
         # pose_head input: (BV, t h w c), output: (BV, feat_dim)
-        pose_result = self.pose_head(pose_results)
+        pose_result = self.pose_head(pose_result)
         pose_result = einops.rearrange(pose_result, '(b v) f -> b v f', b=B, v=V)
 
         if self.only_rtmo :
@@ -221,38 +207,51 @@ class GraphAggregate(nn.Module):
         
         pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) H W C')
         pose_input = pose_input.cpu().numpy()
-        self.pose_model.visualize(pose_input[0])
 
         pose_results = [None, None]
+        keypoints_features_stack =None 
         for i in range(B*V*D):
             result = self.pose_model(pose_input[i])[0].pred_instances
             
             person_graph = []
             keypoint_scores = torch.Tensor(result.keypoint_scores).unsqueeze(dim=2)
             keypoints = torch.Tensor(result.keypoints)
-            keypoint_features = torch.cat([keypoints,keypoint_scores],dim=2) # (N, 14, 3)
+            keypoint_feature = torch.cat([keypoints,keypoint_scores],dim=2)
+        
+            if keypoints_features_stack is None:
+                keypoint_features_stack = keypoint_feature # (N, 14, 3)
+            else :
+                torch.stack([keypoints_features_stack, keypoint_feature],dim=0)
 
-            for keypoint_feature in keypoint_features:
-                print('average confidence:', torch.sum(keypoint_feature[:,2])/14) 
+            #for keypoint_feature in keypoint_features:
+            #    pass
+                #print('average confidence:', torch.sum(keypoint_feature[:,2])/14) 
+            
+            
+            #for keypoint_feature in keypoint_features:
+            #    person_graph.append(generate_intra_spatial_edge(keypoint_feature))
 
-            for keypoint_feature in keypoint_features:
-                person_graph.append(generate_intra_spatial_edge(keypoint_feature))
+            #frame_graph = generate_inter_spatial_edge(person_graph)
 
-            frame_graph = generate_inter_spatial_edge(person_graph)
-
-            visualize_graph(frame_graph,'test/result_graph.jpg')
-            raise NotImplementedError
+            #visualize_graph(frame_graph,'test/result_graph.jpg')
+            #raise NotImplementedError
 
             # (N, 14), (N, 14, 2), (N, 14)
 
+        print(keypoint_features_stack.shape)
+        keypoint_features_stack = keypoint_features_stack.reshape(B,V,-1)
+        print(keypoint_features_stack.shape)
 
+        raise NotImplementedError
         # torch.Size([32, 512, 40, 40]) torch.Size([32, 512, 20, 20])
         
         # torch.Size([B, V, 16, 512, 40, 40]) torch.Size([32, 512, 20, 20])
-        pose_result = self.pose_head((pose_results[0],pose_results[1]), view=V, batch=B, depth=D)
+        #pose_result = self.pose_head((pose_results[0],pose_results[1]), view=V, batch=B, depth=D)
 
         #aux = pose_result
-        aux = self.fuselinear(torch.cat([aux, pose_result],dim=2))
+        #aux = self.fuselinear(torch.cat([aux, pose_result],dim=2))
+        aux += sum
+        print('sum added', sum)
 
         ##################### VIEW ATTENTION #####################
 
@@ -316,11 +315,11 @@ class MVAggregate(nn.Module):
         super().__init__()
 
 
-        for param in pose_model.model.neck.parameters():
-            param.requires_grad = False
+        #for param in pose_model.model.head.parameters():
+        #    param.requires_grad = False
 
-        for param in model.parameters():
-            param.requires_grad = False
+        #for param in model.parameters():
+        #    param.requires_grad = False
 
         self.multi_gpu = multi_gpu
 
@@ -350,6 +349,7 @@ class MVAggregate(nn.Module):
         elif self.agr_type == "mean":
             self.aggregation_model = ViewAvgAggregate(model=model, lifting_net=lifting_net)
         elif use_graph:
+            print('Graph Aggregation Mode')
             self.aggregation_model = GraphAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model)
         else:
             self.aggregation_model = WeightedAggregate(model=model, feat_dim=feat_dim, lifting_net=lifting_net, pose_model=pose_model, multi_gpu=multi_gpu, only_rtmo=only_rtmo, mode=mode)

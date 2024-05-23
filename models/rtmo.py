@@ -18,6 +18,10 @@ from mmpose.evaluation.functional import nearby_joints_nms, nms
 from mmpose.registry import VISUALIZERS
 
 import torch.nn as nn 
+import torchvision.transforms as transforms
+
+import matplotlib.pyplot as plt
+
 
 try:
     from mmdet.apis import inference_detector, init_detector
@@ -42,6 +46,17 @@ ImgType = Union[np.ndarray, Sequence[np.ndarray]]
 ConfigType = Union[Config, ConfigDict]
 ResType = Union[Dict, List[Dict], InstanceData, List[InstanceData]]
 
+def visualize_tensor(img_tensor, dest):
+    img_np = img_tensor.permute(1, 2, 0).detach().cpu().numpy() 
+    img_np = (img_np * 255).astype(np.uint8)
+
+    plt.imshow(img_np)
+    plt.title("Tensor Image Visualization")
+    plt.axis('off')  
+    output_path = (f"test/{dest}.jpg")
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
 def inference_bottomup_modified(model: nn.Module, img: Union[np.ndarray, str]):
     """Inference image with a bottom-up pose estimator.
 
@@ -55,7 +70,9 @@ def inference_bottomup_modified(model: nn.Module, img: Union[np.ndarray, str]):
         ``data_sample.pred_instances.keypoints`` and
         ``data_sample.pred_instances.keypoint_scores``.
     """
+
     pipeline = Compose(model.cfg.test_dataloader.dataset.pipeline)
+
     # prepare data batch
     if isinstance(img, str):
         data_info = dict(img_path=img)
@@ -64,12 +81,11 @@ def inference_bottomup_modified(model: nn.Module, img: Union[np.ndarray, str]):
     data_info.update(model.dataset_meta)
     data = pipeline(data_info)
     batch = pseudo_collate([data])
-
-    #model.data_preprocessor.batch_augments.cuda()
-
+    x = torch.from_numpy(img)
+    
     results = model.test_step(batch)
-
     return results
+
 
 class RTMOBackbone(torch.nn.Module):
     def __init__(self, device='cuda', full_model = False, full_model_weight=False, mode='tiny'):
@@ -136,20 +152,23 @@ class RTMOBackbone(torch.nn.Module):
 
         rtmo = init_model(self.init_setting['pose2d'], self.init_setting['pose2d_weights'], device=self.init_setting['device'])
         self.model = rtmo
+        self.backbone = self.model.backbone
+        self.neck = self.model.neck
+        
+        del self.model.head
+        del self.model.data_preprocessor
 
         self.visualizer = None
 
-    def get_neck_output_hook(self, module, input, output):
-        global neck_output
-        neck_output = output
         
     def forward(self, x):
         if self.full_model:
+
             result = inference_bottomup_modified(self.model, x)
-            
+
             # pose based nms 
             # reference: https://github.com/open-mmlab/mmpose/blob/main/mmpose/apis/inferencers/pose2d_inferencer.py
-            print('before :', len(result[0].pred_instances))
+            #print('before :', len(result[0].pred_instances))
             for ds in result:
                 if len(ds.pred_instances) == 0:
                     continue
@@ -166,7 +185,7 @@ class RTMOBackbone(torch.nn.Module):
                     num_nearby_joints_thr=num_keypoints // 3,
                 )
                 ds.pred_instances = ds.pred_instances[kept_indices]
-            print('nms :', len(result[0].pred_instances))
+            #print('nms :', len(result[0].pred_instances))
             # keypoint threshold filtering 
             kpt_threshold = self.call_setting['kpt_thr']
             for ds in result:
@@ -179,14 +198,23 @@ class RTMOBackbone(torch.nn.Module):
                 kept_indices = np.where(kpt_scores_avg > kpt_threshold)[0]
 
                 ds.pred_instances = ds.pred_instances[kept_indices]
-            print('thresholding :', len(result[0].pred_instances))
+            #print('thresholding :', len(result[0].pred_instances))
 
             return result
         
         else:
-            hook_handle = self.model.neck.register_forward_hook(self.get_neck_output_hook)
-            result = inference_bottomup_modified(self.model, x)
-            return neck_output
+
+            x = transforms.Resize((640,640))(x)
+            
+            print(f"before backbone VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            x = self.backbone(x)
+    
+            print(f"before neck VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            x = self.neck(x)
+    
+            print(f"after neck VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            
+            return x
         
     def visualize(self, x):
         result = inference_bottomup(self.model, x)
