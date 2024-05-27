@@ -47,18 +47,19 @@ class MVNetwork(torch.nn.Module):
 
         network.fc = torch.nn.Sequential()
 
+        self.model = network
         if not use_graph:
-            pose_model = RTMOBackbone(full_model=False, device=device, mode=mode) # only feature
+            self.pose_model = RTMOBackbone(full_model=False, device=device, mode=mode) # only feature
         else:
-            pose_model = RTMOBackbone(full_model=True, device=device, mode=mode) # keypoints
+            self.pose_model = RTMOBackbone(full_model=True, device=device, mode=mode) # keypoints
 
         self.mvnetwork = MVAggregate(
-            model=network,
+            model=self.model,
             agr_type=self.agr_type, 
             feat_dim=self.feat_dim, 
             lifting_net=self.lifting_net,
             multi_gpu=multi_gpu,
-            pose_model=pose_model,
+            pose_model=self.pose_model,
             only_rtmo=only_rtmo,
             use_graph=use_graph,
             mode=mode,

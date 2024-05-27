@@ -3,60 +3,11 @@ import torch
 from torch import nn
 import einops
 from .graph_utils import generate_intra_spatial_edge, generate_inter_spatial_edge, visualize_graph
-from .head import MultiScaleTransformerHead
+from .head import MultiScaleTransformerHead, RTMOHead, RTMOResidualHead
 import numpy as np
 import torchvision.transforms as transforms
 from .rtmo import visualize_tensor
 
-
-class ConvModule(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, groups=1):
-        super(ConvModule, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False, groups=groups)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.activate = nn.SiLU()
-
-    def forward(self, x):
-        return self.activate(self.bn(self.conv(x)))
-
-class RTMOHead(nn.Module):
-    def __init__(self, feat_dim,):
-        super(RTMOHead, self).__init__()
-        # torch.Size([B*V*16, 512, 40, 40]) torch.Size([B*V*D, 512, 20, 20])
-        self.conv_feat_1 = nn.Sequential(
-            ConvModule(512, 256, kernel_size=3, padding=1), 
-            nn.AvgPool2d(kernel_size=3, stride=2,padding=1), # 20 
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            nn.AvgPool2d(kernel_size=3, stride=2,padding=1), # 10
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            ConvModule(256, 2, kernel_size=3, padding=1), # 200
-            nn.Flatten(start_dim=1)
-        )
-        self.conv_feat_2 = nn.Sequential(
-            ConvModule(512, 256, kernel_size=3, padding=1), 
-            nn.AvgPool2d(kernel_size=3, stride=2,padding=1), # 10
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            ConvModule(256, 256, kernel_size=3, padding=1),
-            ConvModule(256, 2, kernel_size=3, padding=1), # 8*8*16*2=1024
-            nn.Flatten(start_dim=1)
-        )
-        self.linear = nn.Linear(feat_dim, feat_dim)
-        self.frame_linear = nn.Linear(feat_dim*16, feat_dim)
-
-
-    def forward(self, x, view, batch, depth):
-        x = torch.cat([
-            self.conv_feat_1(x[0]),
-            self.conv_feat_2(x[1]),
-        ], dim=1)
-        x = self.linear(x)
-        x = einops.rearrange(x, '(B V D) F -> B V (D F)', B=batch, V=view, D=depth)
-        x = self.frame_linear(x)
-        
-        return x
-    
 
 class WeightedAggregate(nn.Module):
     def __init__(self,  model, feat_dim, pose_model, lifting_net=nn.Sequential(), multi_gpu=False, only_rtmo =False, mode='tiny'):
@@ -65,15 +16,18 @@ class WeightedAggregate(nn.Module):
         self.pose_model = pose_model
         self.multi_gpu = multi_gpu
         self.only_rtmo = only_rtmo
+        self.feat_dim = feat_dim
+        self.pose_d = 16
 
         self.MViT_transform = transforms.Compose([
             transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
         ])
-
-        self.pose_head = MultiScaleTransformerHead(feat_dim=feat_dim, multi_gpu=multi_gpu, mode=mode).cuda()
+        
+        #self.pose_head = MultiScaleTransformerHead(feat_dim=feat_dim, multi_gpu=multi_gpu, mode=mode).cuda()
+        self.pose_head = RTMOResidualHead(feat_dim = feat_dim, frame=self.pose_d).cuda()
 
         self.fuselinear = nn.Linear(2*feat_dim, feat_dim)
-
+        
         self.lifting_net = lifting_net
         self.feature_dim = feat_dim
 
@@ -88,8 +42,8 @@ class WeightedAggregate(nn.Module):
 
         self.relu = nn.ReLU()
 
-        if multi_gpu:
-            self.model = self.model.to('cuda:0')
+        print('only_rtmo setting: ', only_rtmo)
+
             
 
     def forward(self, mvimages):
@@ -114,15 +68,21 @@ class WeightedAggregate(nn.Module):
 
         # RTMO output 
         # torch.Size([BVT, H, W, C]) torch.Size([BVT, H/2, W/2, C])
+        #pose_input = mvimages[:, 6:12, :, :, :, :]
 
         pose_input = einops.rearrange(mvimages, 'B V C D H W -> (B V D) C H W')
 
         pose_input = pose_input.flip([1]) # from rgb to bgr (rtmo gets cv2 image) -> c, h, w
-        print(pose_input.shape)
+
         pose_result = self.pose_model(pose_input)
 
         # pose_head input: (BV, t h w c), output: (BV, feat_dim)
-        pose_result = self.pose_head(pose_result)
+        pose_result = (
+            einops.rearrange(pose_result[0], '(B V D) C H W -> (B V) D H W C', B=B,V= V, D= self.pose_d),
+            einops.rearrange(pose_result[1], '(B V D) C H W -> (B V) D H W C', B=B, V=V, D=self.pose_d)
+        )
+    
+        pose_result = self.pose_head(pose_result, batch=B, view=V)
         pose_result = einops.rearrange(pose_result, '(b v) f -> b v f', b=B, v=V)
 
         if self.only_rtmo :
@@ -223,24 +183,7 @@ class GraphAggregate(nn.Module):
             else :
                 torch.stack([keypoints_features_stack, keypoint_feature],dim=0)
 
-            #for keypoint_feature in keypoint_features:
-            #    pass
-                #print('average confidence:', torch.sum(keypoint_feature[:,2])/14) 
-            
-            
-            #for keypoint_feature in keypoint_features:
-            #    person_graph.append(generate_intra_spatial_edge(keypoint_feature))
-
-            #frame_graph = generate_inter_spatial_edge(person_graph)
-
-            #visualize_graph(frame_graph,'test/result_graph.jpg')
-            #raise NotImplementedError
-
-            # (N, 14), (N, 14, 2), (N, 14)
-
-        print(keypoint_features_stack.shape)
         keypoint_features_stack = keypoint_features_stack.reshape(B,V,-1)
-        print(keypoint_features_stack.shape)
 
         raise NotImplementedError
         # torch.Size([32, 512, 40, 40]) torch.Size([32, 512, 20, 20])
@@ -315,11 +258,16 @@ class MVAggregate(nn.Module):
         super().__init__()
 
 
-        #for param in pose_model.model.head.parameters():
-        #    param.requires_grad = False
+        for param in pose_model.parameters():
+            param.requires_grad = True
 
-        #for param in model.parameters():
-        #    param.requires_grad = False
+        for param in pose_model.backbone.parameters():
+            param.requires_grad = False
+
+        if not only_rtmo:
+            for param in model.parameters():
+                param.requires_grad = True
+            print('MViT hot')
 
         self.multi_gpu = multi_gpu
 

@@ -25,6 +25,7 @@ def trainer(train_loader,
             world_size=None,
             fsdp=False,
             sampler = (None,None,None,None),
+            multi_gpu=False,
             ):
     
     train_sampler, valid_sampler, test_sampler, chall_sampler = sampler
@@ -54,7 +55,8 @@ def trainer(train_loader,
             pbar=pbar,
             rank=rank,
             world_size=world_size,
-            sampler = train_sampler 
+            sampler = train_sampler ,
+            multi_gpu=multi_gpu,
         )
 
         results = evaluate(os.path.join(path_dataset, "Train", "annotations.json"), prediction_file)
@@ -73,7 +75,8 @@ def trainer(train_loader,
             set_name="valid",
             rank=rank,
             world_size=world_size,
-            sampler = valid_sampler
+            sampler = valid_sampler,
+            multi_gpu=multi_gpu,
         )
 
         results = evaluate(os.path.join(path_dataset, "Valid", "annotations.json"), prediction_file)
@@ -93,7 +96,8 @@ def trainer(train_loader,
                 set_name="test",
                 rank=rank,
                 world_size=world_size,
-                sampler = test_sampler
+                sampler = test_sampler,
+                multi_gpu=multi_gpu
             )
 
         results = evaluate(os.path.join(path_dataset, "Test", "annotations.json"), prediction_file)
@@ -113,8 +117,9 @@ def trainer(train_loader,
         'scheduler': scheduler.state_dict()
         }
         path_aux = os.path.join(best_model_path, str(epoch+1) + "_model.pth.tar")
-        torch.save(state, path_aux)
-        print(f"model saved at {path_aux}")
+        if epoch % 5 == 0:
+            torch.save(state, path_aux)
+            print(f"model saved at {path_aux}")
         
     pbar.close()    
     return
@@ -132,6 +137,7 @@ def train(dataloader,
           rank=None,
           world_size=None,
           sampler=None,
+          multi_gpu=False,
         ):
     
 
@@ -173,79 +179,88 @@ def train(dataloader,
                 pbar.update()
 
             # compute output
-            outputs_offence_severity, outputs_action, _ = model(mvclips)
-            
-            if len(action) == 1:
-                preds_sev = torch.argmax(outputs_offence_severity, 0)
-                preds_act = torch.argmax(outputs_action, 0)
+            with torch.set_grad_enabled(set_name == "train"):
 
-                values = {}
-                values["Action class"] = INVERSE_EVENT_DICTIONARY["action_class"][preds_act.item()]
-                if preds_sev.item() == 0:
-                    values["Offence"] = "No offence"
-                    values["Severity"] = ""
-                elif preds_sev.item() == 1:
-                    values["Offence"] = "Offence"
-                    values["Severity"] = "1.0"
-                elif preds_sev.item() == 2:
-                    values["Offence"] = "Offence"
-                    values["Severity"] = "3.0"
-                elif preds_sev.item() == 3:
-                    values["Offence"] = "Offence"
-                    values["Severity"] = "5.0"
-                actions[action[0]] = values       
-            else:
-                preds_sev = torch.argmax(outputs_offence_severity.detach().cpu(), 1)
-                preds_act = torch.argmax(outputs_action.detach().cpu(), 1)
+                outputs_offence_severity, outputs_action, _ = model(mvclips)
 
-                for i in range(len(action)):
+                if len(action) == 1:
+                    preds_sev = torch.argmax(outputs_offence_severity, 0)
+                    preds_act = torch.argmax(outputs_action, 0)
+
                     values = {}
-                    values["Action class"] = INVERSE_EVENT_DICTIONARY["action_class"][preds_act[i].item()]
-                    if preds_sev[i].item() == 0:
+                    values["Action class"] = INVERSE_EVENT_DICTIONARY["action_class"][preds_act.item()]
+                    if preds_sev.item() == 0:
                         values["Offence"] = "No offence"
                         values["Severity"] = ""
-                    elif preds_sev[i].item() == 1:
+                    elif preds_sev.item() == 1:
                         values["Offence"] = "Offence"
                         values["Severity"] = "1.0"
-                    elif preds_sev[i].item() == 2:
+                    elif preds_sev.item() == 2:
                         values["Offence"] = "Offence"
                         values["Severity"] = "3.0"
-                    elif preds_sev[i].item() == 3:
+                    elif preds_sev.item() == 3:
                         values["Offence"] = "Offence"
                         values["Severity"] = "5.0"
-                    actions[action[i]] = values       
+                    actions[action[0]] = values       
+                else:
+                    if multi_gpu :
+                        outputs_offence_severity = outputs_offence_severity.reshape(-1, 4)
+                        outputs_action = outputs_action.reshape(-1,8)
+
+                    preds_sev = torch.argmax(outputs_offence_severity.detach().cpu(), 1)
+                    preds_act = torch.argmax(outputs_action.detach().cpu(), 1)
+
+                    for i in range(len(action)):
+                        values = {}
+                        values["Action class"] = INVERSE_EVENT_DICTIONARY["action_class"][preds_act[i].item()]
+                        if preds_sev[i].item() == 0:
+                            values["Offence"] = "No offence"
+                            values["Severity"] = ""
+                        elif preds_sev[i].item() == 1:
+                            values["Offence"] = "Offence"
+                            values["Severity"] = "1.0"
+                        elif preds_sev[i].item() == 2:
+                            values["Offence"] = "Offence"
+                            values["Severity"] = "3.0"
+                        elif preds_sev[i].item() == 3:
+                            values["Offence"] = "Offence"
+                            values["Severity"] = "5.0"
+                        actions[action[i]] = values       
 
             
-            if len(outputs_offence_severity.size()) == 1:
-                outputs_offence_severity = outputs_offence_severity.unsqueeze(0)   
-            if len(outputs_action.size()) == 1:
-                outputs_action = outputs_action.unsqueeze(0)  
+                if len(outputs_offence_severity.size()) == 1:
+                    outputs_offence_severity = outputs_offence_severity.unsqueeze(0)   
+                if len(outputs_action.size()) == 1:
+                    outputs_action = outputs_action.unsqueeze(0)  
    
-            #compute the loss
-            loss_offence_severity = criterion[0](outputs_offence_severity, targets_offence_severity)
-            loss_action = criterion[1](outputs_action, targets_action)
+                #compute the loss
+                loss_offence_severity = criterion[0](outputs_offence_severity, targets_offence_severity)
+                loss_action = criterion[1](outputs_action, targets_action)
 
-            loss = loss_offence_severity + loss_action
+                loss = loss_offence_severity + loss_action
 
-            if train:
-                # compute gradient and do SGD step
-                optimizer.zero_grad()
-                loss.backward()
+                if train:
+                    # compute gradient and do SGD step
+                    optimizer.zero_grad()
+                    loss.backward()
 
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        if param.grad is not None:
-                            print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient: {param.grad.shape}")
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            if param.grad is not None:
+                                continue
+                                print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient: {param.grad.shape}")
+                            else:
+                                continue
+                                print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient is None (potential issue)")
                         else:
-                            print(f"Parameter: {name}, Requires Grad: {param.requires_grad}, Gradient is None (potential issue)")
-                    else:
-                        print(f"Parameter: {name} does not require gradients")
+                            continue
+                            print(f"Parameter: {name} does not require gradients")
 
-                optimizer.step()
+                    optimizer.step()
 
-            loss_total_action += float(loss_action)
-            loss_total_offence_severity += float(loss_offence_severity)
-            total_loss += 1
+                loss_total_action += float(loss_action)
+                loss_total_offence_severity += float(loss_offence_severity)
+                total_loss += 1
             
     
         gc.collect()
@@ -261,9 +276,11 @@ def train(dataloader,
 
 
 # Evaluation function to evaluate the test or the chall set
+@torch.no_grad()
 def evaluation(dataloader,
           model,
           set_name="test",
+          multi_gpu=False,
         ):
     
 
@@ -280,7 +297,8 @@ def evaluation(dataloader,
 
             mvclips = mvclips.cuda().float()
             #mvclips = mvclips.float()
-            outputs_offence_severity, outputs_action, _ = model(mvclips)
+            with torch.no_grad():
+                outputs_offence_severity, outputs_action, _ = model(mvclips)
 
             if len(action) == 1:
                 preds_sev = torch.argmax(outputs_offence_severity, 0)
@@ -302,6 +320,10 @@ def evaluation(dataloader,
                     values["Severity"] = "5.0"
                 actions[action[0]] = values       
             else:
+                if multi_gpu :
+                    outputs_offence_severity = outputs_offence_severity.reshape(-1, 4)
+                    outputs_action = outputs_action.reshape(-1,8)
+
                 preds_sev = torch.argmax(outputs_offence_severity.detach().cpu(), 1)
                 preds_act = torch.argmax(outputs_action.detach().cpu(), 1)
 

@@ -17,6 +17,7 @@ import torchvision.transforms as transforms
 from models import MVNetwork
 from config.classes import EVENT_DICTIONARY, INVERSE_EVENT_DICTIONARY
 from torchvision.transforms import InterpolationMode
+from models import AsymmetricLoss
 
 from torchvision.models.video import R3D_18_Weights, MC3_18_Weights
 from torchvision.models.video import R2Plus1D_18_Weights, S3D_Weights
@@ -36,9 +37,20 @@ from torch.distributed.fsdp.wrap import (
    size_based_auto_wrap_policy,
    
 )
+from torch.distributed.pipeline.sync import Pipe
+from torch.distributed import rpc
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
+
+def init_rpc(rank, world_size):
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=0)
+    rpc.init_rpc(
+        name=f"worker{rank}",
+        rank=rank,
+        world_size=world_size,
+        rpc_backend_options=options
+    )
 
 def checkArguments():
 
@@ -61,7 +73,7 @@ def checkArguments():
         exit()
 
     # args.weighted_loss
-    if args.weighted_loss != 'Yes' and args.weighted_loss != 'No':
+    if args.weighted_loss != 'Yes' and args.weighted_loss != 'asl' and args.weighted_loss != 'No':
         print("Could not find your desired argument for --args.weighted_loss:")
         print("Possible arguments are: Yes or No")
         exit()
@@ -111,9 +123,11 @@ def main(*args):
         continue_training = args.continue_training
         only_evaluation = args.only_evaluation
         path_to_model_weights = args.path_to_model_weights
+        path_to_full_model_weights = args.path_to_full_model_weights
         model_to_store = args.model_to_store
         multi_gpu = args.multi_gpu
         fsdp = args.fsdp
+        rtmo_separation = args.rtmo_separation
     else:
         print("EXIT")
         exit()
@@ -257,17 +271,30 @@ def main(*args):
     ###################################
     #       LOADING THE MODEL         #
     ###################################
-    print(f"VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
-    model = MVNetwork(net_name=pre_model, agr_type=pooling_type, multi_gpu=args.multi_gpu, device=device).cpu()
+    model = MVNetwork(net_name=pre_model, agr_type=pooling_type, multi_gpu=args.multi_gpu, device=device)
 
-    print(f"VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+    if multi_gpu:
+        model = nn.DataParallel(model)
+        model = model.cuda()
+
+    elif rtmo_separation:
+        pass 
+
+    else :
+        model = model.cuda()
 
         
     if path_to_model_weights != "":
         path_model = os.path.join(path_to_model_weights)
         load = torch.load(path_model)
         print('load MViT model...')
+        model.load_state_dict(load['state_dict'], strict=False)
+
+    if path_to_full_model_weights != "":
+        path_model = os.path.join(path_to_full_model_weights)
+        load = torch.load(path_model)
+        print('load full model...')
         model.load_state_dict(load['state_dict'], strict=False)
     
     if args.fsdp:
@@ -307,6 +334,10 @@ def main(*args):
             criterion_offence_severity = nn.CrossEntropyLoss(weight=dataset_Train.getWeights()[0].cuda())
             criterion_action = nn.CrossEntropyLoss(weight=dataset_Train.getWeights()[1].cuda())
             criterion = [criterion_offence_severity, criterion_action]
+        elif weighted_loss == 'asl':
+            criterion_offence_severity = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-1, disable_torch_grad_focal_loss=True)
+            criterion_action = AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-1, disable_torch_grad_focal_loss=True)
+            criterion = [criterion_offence_severity, criterion_action]
         else:
             criterion_offence_severity = nn.CrossEntropyLoss()
             criterion_action = nn.CrossEntropyLoss()
@@ -319,6 +350,7 @@ def main(*args):
             test_loader2,
             model,
             set_name="test",
+            multi_gpu=multi_gpu
         ) 
         results = evaluate(os.path.join(path, "Test", "annotations.json"), prediction_file)
         print("TEST")
@@ -329,6 +361,7 @@ def main(*args):
             chall_loader2,
             model,
             set_name="chall",
+            multi_gpu=multi_gpu
         )
 
         results = evaluate(os.path.join(path, "Chall", "annotations.json"), prediction_file)
@@ -340,6 +373,7 @@ def main(*args):
             test_loader2,
             model,
             set_name="test",
+            multi_gpu=multi_gpu
         )
 
         results = evaluate(os.path.join(path, "Test", "annotations.json"), prediction_file)
@@ -350,6 +384,7 @@ def main(*args):
             chall_loader2,
             model,
             set_name="chall",
+            multi_gpu=multi_gpu
         )
 
         results = evaluate(os.path.join(path, "Chall", "annotations.json"), prediction_file)
@@ -357,7 +392,7 @@ def main(*args):
         print(results)
     else:
         trainer(train_loader, val_loader2, test_loader2, model, optimizer, scheduler, criterion, 
-                best_model_path, epoch_start, model_name=model_name, path_dataset=path, max_epochs=max_epochs, fsdp=fsdp, sampler=(train_sampler, valid_sampler, test_sampler, chall_sampler))
+                best_model_path, epoch_start, model_name=model_name, path_dataset=path, max_epochs=max_epochs, fsdp=fsdp, sampler=(train_sampler, valid_sampler, test_sampler, chall_sampler), multi_gpu=multi_gpu)
     return 0
 
 
@@ -396,13 +431,17 @@ if __name__ == '__main__':
     parser.add_argument("--weight_decay", required=False, type=float, default=0.001, help="Weight decacy")
     parser.add_argument("--multi_gpu", action='store_true', help="Enable multigpu mode")
     parser.add_argument("--fsdp", action='store_true', help="Enable fsdp mode")
+    parser.add_argument("--rtmo_separation", action='store_true', help="Enable separation mode")
     parser.add_argument("--model_to_store", required=False, type=str, default="", help="path to store the model weights")
+
     #parser.add_argument('--rank',   required=False, type=int,   default=60,     help='rank' )
     #parser.add_argument('--world_size',   required=False, type=int,   default=60,   help='world_size' )
 
 
     parser.add_argument("--only_evaluation", required=False, type=int, default=3, help="Only evaluation, 0 = on test set, 1 = on chall set, 2 = on both sets and 3 = train/valid/test")
     parser.add_argument("--path_to_model_weights", required=False, type=str, default="", help="Path to the model weights")
+    parser.add_argument("--path_to_full_model_weights", required=False, type=str, default="", help="Path to the model weights")
+
 
     args = parser.parse_args()
 
@@ -424,6 +463,8 @@ if __name__ == '__main__':
     # Start the main training function
     start=time.time()
     logging.info('Starting main function')
+    #world_size = 7  # 사용할 GPU 수에 맞게 설정
+    #dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=0)
     
     main(args, False)
     logging.info(f'Total Execution Time is {time.time()-start} seconds')

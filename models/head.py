@@ -72,7 +72,6 @@ class MultiScaleTransformerHead(nn.Module):
             self, 
             x: Tuple[torch.Tensor, torch.Tensor],
         )-> torch.Tensor:
-
         x = torch.stack([self.maxpool2d(x[0]), x[1]], dim=-1)
         x, _ = x.max(dim=-1)
 
@@ -337,6 +336,182 @@ class SpatioTemporalBlock(nn.Module):
         return x
 
 
+
+def gaussian_weights(size, center, sigma=1.0):
+    """
+    Gaussian weights centered at the specified point of the vector.
+    
+    Parameters:
+    size (int): The number of elements in the vector.
+    center (float): The center point of the Gaussian distribution.
+    sigma (float): The standard deviation of the Gaussian distribution.
+    
+    Returns:
+    torch.Tensor: A tensor of Gaussian weights.
+    """
+    x = torch.arange(size, dtype=torch.float32)
+    weights = torch.exp(-0.5 * ((x - center) / sigma) ** 2)
+    return weights / weights.sum()
+
+class ConvModule(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, groups=1):
+        super(ConvModule, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False, groups=groups)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activate = nn.SiLU()
+
+    def forward(self, x):
+        return self.activate(self.bn(self.conv(x)))
+
+class RTMOHead(nn.Module):
+    def __init__(self, feat_dim,):
+        super(RTMOHead, self).__init__()
+        self.feat_dim = feat_dim
+        # torch.Size([B*V*16, 256, 40, 40]) torch.Size([B*V*D, 256, 20, 20])
+        self.conv_feat_1 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1), 
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=3, stride=2,padding=1), # 20 
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 1, kernel_size=3, padding=1),
+            nn.Flatten(start_dim = 1)
+        )
+        self.conv_feat_2 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1), 
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 1, kernel_size=3, padding=1), 
+            nn.Flatten(start_dim = 1)
+        )
+        self.linear = nn.Linear(feat_dim, feat_dim)
+        self.frame_linear = nn.Linear(feat_dim*16, feat_dim)
+
+    def forward(self, x, batch, view): # (B V) D H W C -> (B V) F 
+        _, D, _, _, _ = x[0].shape
+        BV = batch*view
+
+        # (B V) D H W C -> (B V D) C H W 
+        x = (
+            einops.rearrange(x[0], 'bv d h w c -> (bv d) c h w', bv=BV),
+            einops.rearrange(x[1], 'bv d h w c -> (bv d) c h w', bv=BV)
+        ) 
+
+        # (B V D) C H W -> (B V D) N F (N=2, F=400)
+        x = torch.stack([
+            self.conv_feat_1(x[0]),
+            self.conv_feat_2(x[1]),
+        ], dim=1)
+
+        x = x.reshape(BV, D, 2, self.feat_dim) # bv d n f 
+        # x.shape: bv, 16, 2, 400
+        
+
+        # Gaussian weight
+        center = 8.5
+        sigma = 1.5
+        weights = gaussian_weights(D, center, sigma).cuda()
+
+        weights = weights.view(1, D, 1, 1)
+
+        x = x * weights
+
+        x = x.sum(dim=1).squeeze() # bv 16 2 400 -> bv 2 400
+        x = x.sum(dim=1).squeeze() # bv 2 400 -> bv 400
+        
+        return x
+
+class RTMOResidualHead(nn.Module):
+    def __init__(self, feat_dim,frame=16):
+        super(RTMOResidualHead, self).__init__()
+        self.feat_dim = feat_dim
+        # torch.Size([B*V*16, 256, 40, 40]) torch.Size([B*V*D, 256, 20, 20])
+
+        self.pooling2d = nn.AvgPool2d(kernel_size=3, stride=2,padding=1) # 20 
+        self.conv_feat_11 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1), 
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_feat_12 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_feat_13 = nn.Sequential(
+            ConvModule(256, 1, kernel_size=3, padding=1),
+            nn.Flatten(start_dim = 1)
+        )
+        self.conv_feat_21 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1), 
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_feat_22 = nn.Sequential(
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            ConvModule(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_feat_23 = nn.Sequential(
+            ConvModule(256, 1, kernel_size=3, padding=1), 
+            nn.Flatten(start_dim = 1)
+        )
+        self.linear = nn.Linear(feat_dim, feat_dim)
+        self.frame_linear = nn.Linear(feat_dim*frame, feat_dim)
+
+    def forward(self, x, batch, view): # (B V) D H W C -> (B V) F 
+        _, D, _, _, _ = x[0].shape
+        BV = batch*view
+
+        # (B V) D H W C -> (B V D) C H W 
+        x = (
+            einops.rearrange(x[0], 'bv d h w c -> (bv d) c h w', bv=BV),
+            einops.rearrange(x[1], 'bv d h w c -> (bv d) c h w', bv=BV)
+        ) 
+
+        # (B V D) C H W -> (B V D) N F (N=2, F=400)
+        x0 = self.pooling2d(x[0])
+        x0 = self.conv_feat_11(x0)+ x0
+        x0 = self.conv_feat_12(x0) + x0
+        x1 = self.conv_feat_21(x[1])+x[1]
+        x1 = self.conv_feat_22(x1)+x1
+
+        x = torch.stack([
+            self.conv_feat_13(x0),
+            self.conv_feat_23(x1),
+        ], dim=1)
+
+        x = x.reshape(BV, D, 2, self.feat_dim) # bv d n f 
+        # x.shape: bv, 16, 2, 400
+        
+
+        # Gaussian weight
+        center = 8.5
+        sigma = 1.5
+        weights = gaussian_weights(D, center, sigma).cuda()
+
+        weights = weights.view(1, D, 1, 1)
+
+        x = x * weights
+
+        x = x.sum(dim=1).squeeze() # bv 16 2 400 -> bv 2 400
+        x = x.sum(dim=1).squeeze() # bv 2 400 -> bv 400
+        
+        return x
+
 if __name__=='__main__':
 
     test = MultiScaleTransformerHead(feat_dim=400)
@@ -344,4 +519,3 @@ if __name__=='__main__':
     x2 = torch.rand((4,16,20,20,512),dtype=torch.float)
 
     x = test((x,x2))
-    print(x.shape)

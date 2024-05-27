@@ -19,6 +19,7 @@ from mmpose.registry import VISUALIZERS
 
 import torch.nn as nn 
 import torchvision.transforms as transforms
+import torch.nn.functional as F
 
 import matplotlib.pyplot as plt
 
@@ -154,7 +155,7 @@ class RTMOBackbone(torch.nn.Module):
         self.model = rtmo
         self.backbone = self.model.backbone
         self.neck = self.model.neck
-        
+
         del self.model.head
         del self.model.data_preprocessor
 
@@ -204,16 +205,10 @@ class RTMOBackbone(torch.nn.Module):
         
         else:
 
-            x = transforms.Resize((640,640))(x)
-            
-            print(f"before backbone VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            x = F.interpolate(x, size=(640,640), mode='nearest-exact')
             x = self.backbone(x)
-    
-            print(f"before neck VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
             x = self.neck(x)
     
-            print(f"after neck VRAM used after model loaded: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            
             return x
         
     def visualize(self, x):
