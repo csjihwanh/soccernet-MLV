@@ -3,6 +3,7 @@ import os
 import torch
 import json
 from config.classes import EVENT_DICTIONARY
+import random
 
 ##############################################################
 #                                                            #
@@ -180,6 +181,7 @@ def clips2vectormerge(folder_path, split, num_views, not_taking):
 				if os.path.exists(os.path.join(path_clip, "clip_3.mp4")):
 					path_clip_3 = os.path.join(path_clip, "clip_3.mp4")
 					clips_all_view.append(path_clip_3)
+
 				clips.append(clips_all_view)
 
 		return clips

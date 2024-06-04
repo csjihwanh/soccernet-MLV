@@ -3,10 +3,21 @@ from random import random
 import torch
 import random
 from .data_loader import label2vectormerge, clips2vectormerge
-from torchvision.io.video import read_video
+from decord import VideoReader, cpu
+import torchvision.transforms as T
+from videochat2.dataset.video_transforms import (
+    GroupNormalize, GroupScale, GroupCenterCrop, 
+    Stack, ToTorchFormatTensor
+)
+from PIL import Image
+import numpy as np
+from torchvision.transforms.functional import InterpolationMode
+import random
+import einops
+
 
 class MultiViewDataset(Dataset):
-    def __init__(self, path, start, end, fps, split, num_views, transform=None, transform_model=None):
+    def __init__(self, path, start, end, fps, split, num_views, transform=None):
 
         if split != 'Chall':
             # To load the annotations
@@ -41,7 +52,6 @@ class MultiViewDataset(Dataset):
         self.start = start
         self.end = end
         self.transform = transform
-        self.transform_model = transform_model
         self.num_views = num_views
 
         self.factor = (end - start) / (((end - start) / 25) * fps)
@@ -65,57 +75,38 @@ class MultiViewDataset(Dataset):
     def __getitem__(self, index):
 
         prev_views = []
+        target_views = 4
 
         for num_view in range(len(self.clips[index])):
 
             index_view = num_view
 
-            if len(prev_views) == 2:
-                continue
+            # Add the current view to prev_views if it's not already present
+            if index_view not in prev_views:
+                prev_views.append(index_view)
 
             # As we use a batch size > 1 during training, we always randomly select two views even if we have more than two views.
             # As the batch size during validation and testing is 1, we can have 2, 3 or 4 views per action.
-            cont = True
-            if self.split == 'Train':
-                while cont:
-                    aux = random.randint(0,len(self.clips[index])-1)
-                    if aux not in prev_views:
-                        cont = False
-                index_view = aux
-                prev_views.append(index_view)
-
-
-            video, _, _ = read_video(self.clips[index][index_view], output_format="THWC", pts_unit='sec')
-            frames = video[self.start:self.end,:,:,:]
-
-            final_frames = None
-
-            for j in range(len(frames)):
-                if j%self.factor<1:
-                    if final_frames == None:
-                        final_frames = frames[j,:,:,:].unsqueeze(0)
-                    else:
-                        final_frames = torch.cat((final_frames, frames[j,:,:,:].unsqueeze(0)), 0)
-
-            final_frames = final_frames.permute(0, 3, 1, 2)
-
-            if self.transform != None:
-                final_frames = self.transform(final_frames)
-
-            final_frames = self.transform_model(final_frames)
-            #final_frames = final_frames.permute(0, 1, 2, 3)
-            #final_frames = final_frames.permute(1, 0, 2, 3)
+            
+            video = load_video(self.clips[index][index_view], transform_aug=self.transform, start_frame=self.start, end_frame=self.end)
             
             if num_view == 0:
-                videos = final_frames.unsqueeze(0)
+                videos = video.unsqueeze(0)
             else:
-                final_frames = final_frames.unsqueeze(0)
-                videos = torch.cat((videos, final_frames), 0)
+                video = video.unsqueeze(0)
+                videos = torch.cat((videos, video), 0)
+        
+        if len(prev_views) == 2:
+            video1 = videos[1].unsqueeze(0)
+            videos = torch.cat((videos, video1), 0)
+            videos = torch.cat((videos, video1), 0)
+        elif len(prev_views) == 3:
+            rand_idx = random.choice([1, 2])
+            video1 = videos[rand_idx].unsqueeze(0)
+            videos = torch.cat((videos, video1), 0)
 
         if self.num_views != 1 and self.num_views != 5:
             videos = videos.squeeze()   
-
-        videos = videos.permute(0, 2, 1, 3, 4)
 
         if self.split != 'Chall':
             return self.labels_offence_severity[index][0], self.labels_action[index][0], videos, self.number_of_actions[index]
@@ -125,3 +116,50 @@ class MultiViewDataset(Dataset):
     def __len__(self):
         return self.length
 
+
+def get_frame_indices(start_frame, end_frame, num_segments):
+    """Generate frame indices from start_frame to end_frame divided into num_segments."""
+    indices = np.linspace(start_frame, end_frame, num_segments, dtype=int)
+    return indices
+
+def load_video(video_path, start_frame, end_frame, transform_aug= None, return_msg=False, resolution=224):
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+    
+    num_frames = len(vr)
+
+    frame_indices = range(start_frame, end_frame)
+
+    # transform
+    crop_size = resolution
+    scale_size = resolution
+    input_mean = [0.48145466, 0.4578275, 0.40821073]
+    input_std = [0.26862954, 0.26130258, 0.27577711]
+
+    transform = T.Compose([
+        GroupScale(int(scale_size), interpolation=InterpolationMode.BICUBIC),
+        GroupCenterCrop(crop_size),
+        Stack(),
+        ToTorchFormatTensor(),
+        GroupNormalize(input_mean, input_std) 
+    ])
+
+    images_group = list()
+    for frame_index in frame_indices:
+        img = Image.fromarray(vr[frame_index].numpy())
+        images_group.append(img)
+    torch_imgs = transform(images_group)
+
+    if transform_aug is not None:
+        TC, H, W = torch_imgs.shape
+        torch_imgs = torch_imgs.reshape((TC//3, 3, H, W))
+        torch_imgs = transform_aug(torch_imgs)
+        torch_imgs = torch_imgs.reshape((TC,H,W))
+
+    if return_msg:
+        fps = float(vr.get_avg_fps())
+        sec = ", ".join([str(round(f / fps, 1)) for f in frame_indices])
+        # " " should be added in the start and end
+        msg = f"The video contains {len(frame_indices)} frames sampled at {sec} seconds."
+        return torch_imgs, msg
+    else:
+        return torch_imgs
