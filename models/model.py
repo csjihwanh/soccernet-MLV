@@ -1,69 +1,113 @@
-
-import __future__
 import torch
-from .mvaggregate import MVAggregate
-from torchvision.models.video import r3d_18, R3D_18_Weights, MC3_18_Weights, mc3_18
-from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights, s3d, S3D_Weights
-from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights, mvit_v1_b, MViT_V1_B_Weights
-from .rtmo import RTMOBackbone
+from torch import nn
+import einops
+import numpy as np
+import torchvision.transforms as transforms
+from videochat2 import VideoChat2
 
-class MVNetwork(torch.nn.Module):
 
-    def __init__(self, net_name='r2plus1d_18', agr_type='max', lifting_net=torch.nn.Sequential(), multi_gpu=False, full_model_weight=False, device='cuda'):
+class WeightedAggregate(nn.Module):
+    def __init__(self, feat_dim):
         super().__init__()
+        self.vlm = VideoChat2()
 
-        ######
-        use_graph = False
-        only_rtmo = False
-        mode='small'
-        #####
+        self.token_num = 96
+        self.feat_dim = feat_dim
 
-        self.net_name = net_name
-        self.agr_type = agr_type
-        self.lifting_net = lifting_net
-        
-        self.feat_dim = 512
-        
-        if net_name == "r3d_18":
-            weights_model = R3D_18_Weights.DEFAULT
-            network = r3d_18(weights=weights_model)
-        elif net_name == "s3d":
-            weights_model = S3D_Weights.DEFAULT
-            network = s3d(weights=weights_model)
-            self.feat_dim = 400
-        elif net_name == "mc3_18":
-            weights_model = MC3_18_Weights.DEFAULT
-            network = mc3_18(weights=weights_model)
-        elif net_name == "r2plus1d_18":
-            weights_model = R2Plus1D_18_Weights.DEFAULT
-            network = r2plus1d_18(weights=weights_model)
-        elif net_name == "mvit_v2_s":
-            weights_model = MViT_V2_S_Weights.DEFAULT
-            network = mvit_v2_s(weights=weights_model)
-            self.feat_dim = 400
-        else:
-            weights_model = R2Plus1D_18_Weights.DEFAULT
-            network = r2plus1d_18(weights=weights_model)
+        r1 = -1
+        r2 = 1
+        self.attention_weights = nn.Parameter((r1 - r2) * torch.rand(feat_dim, feat_dim) + r2)
 
-        network.fc = torch.nn.Sequential()
+        self.normReLu = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.ReLU()
+        )        
 
-        self.model = network
-        if not use_graph:
-            self.pose_model = RTMOBackbone(full_model=False, device=device, mode=mode) # only feature
-        else:
-            self.pose_model = RTMOBackbone(full_model=True, device=device, mode=mode) # keypoints
+        self.relu = nn.ReLU()
 
-        self.mvnetwork = MVAggregate(
-            model=self.model,
-            agr_type=self.agr_type, 
-            feat_dim=self.feat_dim, 
-            lifting_net=self.lifting_net,
-            multi_gpu=multi_gpu,
-            pose_model=self.pose_model,
-            only_rtmo=only_rtmo,
-            use_graph=use_graph,
-            mode=mode,
-        )
+        seq_len = 32
+
+        nhead = 8
+        num_layers = 6
 
     def forward(self, mvimages):
-        return self.mvnetwork(mvimages)
+        # torch.Size([b, v, tc, h, w])
+
+        B, V, TC, H, W = mvimages.shape
+
+        mvimages = einops.rearrange(mvimages, 'B V TC H W -> (B V) TC H W', B=B, V=V)
+
+        aux = self.vlm(mvimages) # 6, 96, 4096
+        aux = aux.reshape(B, V, self.token_num, self.feat_dim) # b v 96 4096
+
+        aux = aux.mean(dim=2) # b v 1 4096 
+        aux = aux.to(torch.float32)
+
+        ##################### VIEW ATTENTION #####################
+        
+        # S = source length 
+        # N = batch size
+        # E = embedding dimension
+        # L = target length
+        
+        aux = torch.matmul(aux, self.attention_weights)
+        # Dimension S, E for two views (2,512)
+
+        # Dimension N, S, E
+        aux_t = aux.permute(0, 2, 1)
+
+        prod = torch.bmm(aux, aux_t)
+        relu_res = self.relu(prod)
+        
+        aux_sum = torch.sum(torch.reshape(relu_res, (B, V*V)).T, dim=0).unsqueeze(0)
+        final_attention_weights = torch.div(torch.reshape(relu_res, (B, V*V)).T, aux_sum.squeeze(0))
+        final_attention_weights = final_attention_weights.T
+
+        final_attention_weights = torch.reshape(final_attention_weights, (B, V, V))
+
+        final_attention_weights = torch.sum(final_attention_weights, 1)
+
+        output = torch.mul(aux.squeeze(), final_attention_weights.unsqueeze(-1))
+
+        output = torch.sum(output, 1)
+
+        return output.squeeze(), final_attention_weights
+    
+
+class Model(nn.Module):
+    def __init__(self, feat_dim=768):
+        super().__init__()
+
+        inter_dim = feat_dim
+
+        self.inter = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, inter_dim),
+            nn.Linear(inter_dim, inter_dim),
+        )
+
+        self.fc_offence = nn.Sequential(
+            nn.LayerNorm(inter_dim),
+            nn.Linear(inter_dim, inter_dim),
+            nn.Linear(inter_dim, 4)
+        )
+
+        self.fc_action = nn.Sequential(
+            nn.LayerNorm(inter_dim),
+            nn.Linear(inter_dim, inter_dim),
+            nn.Linear(inter_dim, 8)
+        )
+
+        self.aggregation_model = WeightedAggregate(feat_dim)
+
+
+
+    def forward(self, mvimages):
+        
+        pooled_view, attention = self.aggregation_model(mvimages)
+
+        inter = self.inter(pooled_view)
+        pred_action = self.fc_action(inter)
+        pred_offence_severity = self.fc_offence(inter)
+
+        return pred_offence_severity, pred_action, attention
