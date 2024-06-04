@@ -4,34 +4,16 @@ the experiments are conducted in CUDA 11.7
 
 ## Installation
 
-conda create --name snpose python=3.9 -y
+```
+conda create -n snMLV python=3.9
 
-conda activate snpose
-
-conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
-
-pip install -U openmim
-
-mim install mmengine
-
-mim install "mmcv>=2.0.1"
-
-mim install "mmdet>=3.1.0"
-
-mim install "mmpose>=1.1.0"
-
-pip install soccernet
-
-pip install imageio
+conda activate snMLV
 
 pip install -r requirements.txt
 
-pip install pyav
 
-pip install torch_geometric
 
-pip install networkx
-
+```
 
 ## Weights
 
