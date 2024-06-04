@@ -7,9 +7,9 @@ from videochat2 import VideoChat2
 
 
 class WeightedAggregate(nn.Module):
-    def __init__(self, feat_dim):
+    def __init__(self, feat_dim, pre_weight):
         super().__init__()
-        self.vlm = VideoChat2()
+        self.vlm = VideoChat2(pre_weight = pre_weight)
 
         self.token_num = 96
         self.feat_dim = feat_dim
@@ -75,7 +75,7 @@ class WeightedAggregate(nn.Module):
     
 
 class Model(nn.Module):
-    def __init__(self, feat_dim=768):
+    def __init__(self, feat_dim=768, pre_weight):
         super().__init__()
 
         inter_dim = feat_dim
@@ -98,7 +98,7 @@ class Model(nn.Module):
             nn.Linear(inter_dim, 8)
         )
 
-        self.aggregation_model = WeightedAggregate(feat_dim)
+        self.aggregation_model = WeightedAggregate(feat_dim, pre_weight=pre_weight)
 
 
 

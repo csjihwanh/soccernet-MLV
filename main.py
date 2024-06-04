@@ -172,7 +172,10 @@ def main(*args):
     #       LOADING THE MODEL         #
     ###################################
 
-    model = Model()
+    if path_to_model_weights != "":
+        model = Model(pre_weight=False)
+    else: 
+        model = Model(pre_weight=True)
 
     if multi_gpu:
         model = nn.DataParallel(model)
