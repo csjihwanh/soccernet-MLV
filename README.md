@@ -1,6 +1,6 @@
 # soccernet-MLV
 
-This repository is build based on [VARS](https://github.com/SoccerNet/sn-mvfoul/tree/main/VARS%20model) and [VideoChat2](https://github.com/OpenGVLab/Ask-Anything/tree/main/video_chat2).
+This repository is built based on [VARS](https://github.com/SoccerNet/sn-mvfoul/tree/main/VARS%20model) and [VideoChat2](https://github.com/OpenGVLab/Ask-Anything/tree/main/video_chat2).
 
 ## Architecture
 <img width="1206" alt="architecture" src="https://github.com/Jordano-Jackson/soccernet-MLV/assets/19871043/5488b52b-6bdb-4e8b-bb2b-4cf61380855f">
