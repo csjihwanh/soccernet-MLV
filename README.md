@@ -1,8 +1,11 @@
-# soccernet-pose
+# soccernet-MLV
 
-the experiments are conducted in CUDA 11.7
+This repository is build based on [VARS](https://github.com/SoccerNet/sn-mvfoul/tree/main/VARS%20model) and [VideoChat2](https://github.com/OpenGVLab/Ask-Anything/tree/main/video_chat2).
+
 
 ## Installation
+
+the experiments are conducted in CUDA 11.7
 
 ```
 conda create -n snMLV python=3.9
@@ -11,44 +14,38 @@ conda activate snMLV
 
 pip install -r requirements.txt
 
-
-
+pip install soccernet
 ```
 
-## Weights
+## Checkpoints
 
-VARS baseline weight: https://drive.google.com/drive/folders/1N0Lv-lcpW8w34_iySc7pnlQ6eFMSDvXn
+Download a pretrained checkpoint file from our [drive](https://drive.google.com/file/d/1rM3im9uVysbFdD76zcvZckZahHp1VdzF/view?usp=sharing).
 
-download it into `weights/` directory and then change its name to 'vars_baseline.tar'
-
-RTMO config: https://github.com/open-mmlab/mmpose/blob/dev-1.x/configs/body_2d_keypoint/rtmo/crowdpose/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py
-
-RTMO weight: https://download.openmmlab.com/mmpose/v1/projects/rtmo/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth
-
-
+Then place the file in `checkpoints/` directory.
 
 ## command
 
+### Evaluation
 ```
 python main.py \
---path path/to/your/dataset \
---model_name SNPOSE \
---path_to_model_weights path/to/user/checkpoint \
---start_frame 63 \
---end_frame 87 \
---fps 17 \
---pooling_type "attention" \
---pre_model "mvit_v2_s"
+--path path/to/dataset \
+--model_name your_model_name \
+--start_frame 67 \
+--end_frame 83 \
+--path_to_model_weight path/to/your/checkpoint \
+--only_evaluation type \
+--multi_gpu
 ```
 
-## RTMO visualization
-
+### Training 
 ```
-python video_demo.py path/to/video \
---pose2d ../config/rtmo-l_16xb16-700e_body7-crowdpose-640x640.py \
---pose2d_weights ../weights/rtmo-l_16xb16-700e_body7-crowdpose-640x640-5bafdc11_20231219.pth \
---vis-out-dir result.mp4 
+python main.py \
+--path path/to/dataset \
+--model_name your_model_name \
+--start_frame 67 \
+--end_frame 83 \
+--path_to_model_weight path/to/your/checkpoint \
+--model_to_store path/to/store \
+--multi_gpu
 ```
-
-
 
