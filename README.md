@@ -2,12 +2,19 @@
 
 This repository is built based on [VARS](https://github.com/SoccerNet/sn-mvfoul/tree/main/VARS%20model) and [VideoChat2](https://github.com/OpenGVLab/Ask-Anything/tree/main/video_chat2).
 
+## Instruction 
+Our method, VF-VARS, is a model developed for the [SoccerNet challenges](https://www.soccer-net.org/tasks/new-multi-view-foul-recognition) of the [2024 CVPR CVsports workshop](https://vap.aau.dk/cvsports/).
+
+❗️ update
+* Our model achieved 2nd place out of 17 teams on the official leaderboards.
+* We are participating in the SoccerNet paper submission, which will be published soon.
+
 ## Architecture
 <img width="1206" alt="architecture" src="https://github.com/Jordano-Jackson/soccernet-MLV/assets/19871043/5488b52b-6bdb-4e8b-bb2b-4cf61380855f">
 
 E represents the VideoChat2 encoder module, A denotes the aggregation module, and C is the classification head.
 
-See our [technical report]() for details.
+See our [technical report](https://github.com/user-attachments/files/16122185/VF_VARS_v3.pdf) for details.
 
 
 ## Installation
