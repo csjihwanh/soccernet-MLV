@@ -22,7 +22,7 @@ tensorflow==2.16.1
 termcolor==2.4.0
 timm==0.5.4
 tokenizers==0.19.1
-torch==1.13.1+cu117
+torch==2.2.0
 torchvision==0.14.1+cu117
 tqdm==4.66.1
 transformers==4.40.1
